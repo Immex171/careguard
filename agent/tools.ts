@@ -18,6 +18,14 @@ import { stellar as stellarCharge } from "@stellar/mpp/charge/client";
 import type { SpendingPolicy, Transaction } from "../shared/types.ts";
 import { SPENDING_TIMEZONE, getLocalDateStr } from "./tz.ts";
 export { SPENDING_TIMEZONE, getLocalDateStr };
+import {
+  x402SettlementsTotal,
+  paymentsUsdcTotal,
+  stellarTxSubmittedTotal,
+  policyBlocksTotal,
+  agentSpendingUsd,
+  agentTransactionsTotal,
+} from "../shared/metrics.ts";
 
 // Environment
 const AGENT_SECRET_KEY = process.env.AGENT_SECRET_KEY;
@@ -151,6 +159,7 @@ export async function comparePharmacyPrices(drugName: string, zipCode: string = 
   // Extract real Stellar tx hash from x402 payment response header
   const txHash = extractX402TxHash(response);
 
+  x402SettlementsTotal.inc();
   spendingTracker.serviceFees += 0.002;
   spendingTracker.transactions.push({
     id: `tx-${Date.now()}`,
@@ -163,6 +172,8 @@ export async function comparePharmacyPrices(drugName: string, zipCode: string = 
     status: "completed",
     category: "service_fees",
   });
+  agentTransactionsTotal.inc({ status: "completed" });
+  agentSpendingUsd.set({ category: "service_fees" }, spendingTracker.serviceFees);
   saveSpending(spendingTracker);
 
   return data;
@@ -263,6 +274,7 @@ export async function auditBill(lineItems: Array<{ description: string; cptCode:
 
   const txHash = extractX402TxHash(response);
 
+  x402SettlementsTotal.inc();
   spendingTracker.serviceFees += 0.01;
   spendingTracker.transactions.push({
     id: `tx-${Date.now()}`,
@@ -275,6 +287,8 @@ export async function auditBill(lineItems: Array<{ description: string; cptCode:
     status: "completed",
     category: "service_fees",
   });
+  agentTransactionsTotal.inc({ status: "completed" });
+  agentSpendingUsd.set({ category: "service_fees" }, spendingTracker.serviceFees);
   saveSpending(spendingTracker);
 
   return data;
@@ -296,6 +310,7 @@ export async function checkDrugInteractions(medications: string[]) {
 
   const txHash = extractX402TxHash(response);
 
+  x402SettlementsTotal.inc();
   spendingTracker.serviceFees += 0.001;
   spendingTracker.transactions.push({
     id: `tx-${Date.now()}`,
@@ -308,6 +323,8 @@ export async function checkDrugInteractions(medications: string[]) {
     status: "completed",
     category: "service_fees",
   });
+  agentTransactionsTotal.inc({ status: "completed" });
+  agentSpendingUsd.set({ category: "service_fees" }, spendingTracker.serviceFees);
   saveSpending(spendingTracker);
 
   return data;
@@ -349,14 +366,20 @@ export async function payForMedication(pharmacyId: string, pharmacyName: string,
     return { success: false, error: `Invalid payment amount: $${amount}. Amount must be a positive finite number <= $${MAX_PAYMENT}.` };
   }
   const policyCheck = checkSpendingPolicy(amount, "medications");
-  if (!policyCheck.allowed) return { success: false, error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}` };
+  if (!policyCheck.allowed) {
+    const reason = policyCheck.reason.includes("daily") ? "daily_limit" : "budget";
+    policyBlocksTotal.inc({ reason });
+    return { success: false, error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}` };
+  }
   if (policyCheck.requiresApproval && !skipApproval) {
+    policyBlocksTotal.inc({ reason: "approval_required" });
     const tx: Transaction = {
       id: `tx-${Date.now()}`, timestamp: new Date().toISOString(), type: "medication",
       description: `${drugName} from ${pharmacyName}`, amount, recipient: pharmacyId,
       status: "pending", category: "medications",
     };
     spendingTracker.transactions.push(tx);
+    agentTransactionsTotal.inc({ status: "pending" });
     saveSpending(spendingTracker);
     return { success: false, error: `REQUIRES CAREGIVER APPROVAL: $${amount.toFixed(2)} exceeds the $${currentPolicy.approvalThreshold} approval threshold.`, transaction: tx };
   }
@@ -396,8 +419,12 @@ export async function payForMedication(pharmacyId: string, pharmacyName: string,
       throw new Error(data.error || "MPP payment failed");
     }
   } catch (err: any) {
+    stellarTxSubmittedTotal.inc({ result: "error" });
     return { success: false, error: `MPP payment failed: ${err.message}` };
   }
+
+  stellarTxSubmittedTotal.inc({ result: "success" });
+  paymentsUsdcTotal.inc({ type: "medication" });
 
   const tx: Transaction = {
     id: `tx-${Date.now()}`, timestamp: new Date().toISOString(), type: "medication",
@@ -407,6 +434,8 @@ export async function payForMedication(pharmacyId: string, pharmacyName: string,
 
   spendingTracker.medications += amount;
   spendingTracker.transactions.push(tx);
+  agentTransactionsTotal.inc({ status: "completed" });
+  agentSpendingUsd.set({ category: "medications" }, spendingTracker.medications);
   saveSpending(spendingTracker);
 
   return { success: true, transaction: tx };
@@ -418,14 +447,20 @@ export async function payBill(providerId: string, providerName: string, descript
     return { success: false, error: `Invalid payment amount: $${amount}. Amount must be a positive finite number <= $${MAX_PAYMENT}.` };
   }
   const policyCheck = checkSpendingPolicy(amount, "bills");
-  if (!policyCheck.allowed) return { success: false, error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}` };
+  if (!policyCheck.allowed) {
+    const reason = policyCheck.reason.includes("daily") ? "daily_limit" : "budget";
+    policyBlocksTotal.inc({ reason });
+    return { success: false, error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}` };
+  }
   if (policyCheck.requiresApproval && !skipApproval) {
+    policyBlocksTotal.inc({ reason: "approval_required" });
     const tx: Transaction = {
       id: `tx-${Date.now()}`, timestamp: new Date().toISOString(), type: "bill",
       description: `${description} — ${providerName}`, amount, recipient: providerId,
       status: "pending", category: "bills",
     };
     spendingTracker.transactions.push(tx);
+    agentTransactionsTotal.inc({ status: "pending" });
     saveSpending(spendingTracker);
     return { success: false, error: `REQUIRES CAREGIVER APPROVAL: $${amount.toFixed(2)} exceeds the $${currentPolicy.approvalThreshold} approval threshold.`, transaction: tx };
   }
@@ -472,9 +507,13 @@ export async function payBill(providerId: string, providerName: string, descript
     stellarTxHash = (result as any).hash;
     logger.info({ txHash: stellarTxHash }, "[Stellar] TX confirmed");
   } catch (err: any) {
+    stellarTxSubmittedTotal.inc({ result: "error" });
     const errorDetail = err?.response?.data?.extras?.result_codes || err.message;
     return { success: false, error: `Stellar USDC transfer failed: ${JSON.stringify(errorDetail)}` };
   }
+
+  stellarTxSubmittedTotal.inc({ result: "success" });
+  paymentsUsdcTotal.inc({ type: "bill" });
 
   const tx: Transaction = {
     id: `tx-${Date.now()}`, timestamp: new Date().toISOString(), type: "bill",
@@ -484,6 +523,8 @@ export async function payBill(providerId: string, providerName: string, descript
 
   spendingTracker.bills += amount;
   spendingTracker.transactions.push(tx);
+  agentTransactionsTotal.inc({ status: "completed" });
+  agentSpendingUsd.set({ category: "bills" }, spendingTracker.bills);
   saveSpending(spendingTracker);
 
   return { success: true, transaction: tx };

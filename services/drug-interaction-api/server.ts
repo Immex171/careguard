@@ -18,6 +18,8 @@ import { applyX402Middleware, NETWORK, OZ_FACILITATOR_URL } from "../../shared/x
 import { createCorsMiddleware } from "../../shared/cors.ts";
 import { applySecurityMiddleware } from "../../shared/security-middleware.ts";
 import { logger } from "../../shared/logger.ts";
+import { requestContextMiddleware } from "../../shared/request-context.ts";
+import { requestLoggerMiddleware } from "../../shared/request-logger.ts";
 
 const PORT = parseInt(process.env.DRUG_INTERACTION_API_PORT || "3003");
 const PAY_TO = process.env.PHARMACY_2_PUBLIC_KEY;
@@ -70,6 +72,8 @@ const app = express();
 applySecurityMiddleware(app);
 app.use(createCorsMiddleware());
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT ?? "20kb" }));
+app.use(requestContextMiddleware());
+app.use(requestLoggerMiddleware());
 
 app.get("/", (_req, res) => {
   res.json({ service: "CareGuard Drug Interaction Check API", version: "1.0.0", protocol: "x402 on Stellar", network: NETWORK, payTo: PAY_TO, price: "$0.001 per check" });

@@ -29,6 +29,15 @@ import { buildScrubSession, scrubText } from "./shared/prompt-scrub.ts";
 // Sentry (gated by SENTRY_DSN)
 import { initSentry } from "./shared/sentry.ts";
 
+// Observability
+import { requestContextMiddleware, setAgentRunId, getRequestId } from "./shared/request-context.ts";
+import { requestLoggerMiddleware } from "./shared/request-logger.ts";
+import {
+  metricsHandler,
+  agentRunsTotal,
+  agentToolCallsTotal,
+} from "./shared/metrics.ts";
+
 // Shared agent pause state + wallet low-balance scheduler
 import {
   getAgentState,
@@ -120,6 +129,11 @@ const _largeJson = express.json({ limit: process.env.BILL_AUDIT_BODY_LIMIT ?? "2
 app.use((req, res, next) =>
   (req.path.startsWith("/bill/audit") ? _largeJson : _smallJson)(req, res, next)
 );
+app.use(requestContextMiddleware());
+app.use(requestLoggerMiddleware());
+
+// --- Prometheus metrics ---
+app.get("/metrics", metricsHandler());
 
 // --- Root info ---
 app.get("/", (_req, res) => {
@@ -868,47 +882,67 @@ const LLM_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] =
   }));
 
 async function executeTool(name: string, input: any): Promise<any> {
-  switch (name) {
-    case "compare_pharmacy_prices":
-      return await comparePharmacyPrices(input.drug_name, input.zip_code);
-    case "audit_medical_bill": {
-      const items =
-        typeof input.line_items_json === "string"
-          ? JSON.parse(input.line_items_json)
-          : input.line_items || input.line_items_json;
-      return await auditBill(items);
+  let result: any;
+  try {
+    switch (name) {
+      case "compare_pharmacy_prices":
+        result = await comparePharmacyPrices(input.drug_name, input.zip_code);
+        break;
+      case "audit_medical_bill": {
+        const items =
+          typeof input.line_items_json === "string"
+            ? JSON.parse(input.line_items_json)
+            : input.line_items || input.line_items_json;
+        result = await auditBill(items);
+        break;
+      }
+      case "fetch_rosa_bill":
+        result = await fetchRosaBill();
+        break;
+      case "fetch_and_audit_bill":
+        result = await fetchAndAuditBill();
+        break;
+      case "check_drug_interactions":
+        result = await checkDrugInteractions(input.medications);
+        break;
+      case "pay_for_medication":
+        result = await payForMedication(
+          input.pharmacy_id,
+          input.pharmacy_name,
+          input.drug_name,
+          parseFloat(input.amount),
+        );
+        break;
+      case "pay_bill":
+        result = await payBill(
+          input.provider_id,
+          input.provider_name,
+          input.description,
+          parseFloat(input.amount),
+        );
+        break;
+      case "check_spending_policy":
+        result = checkSpendingPolicy(parseFloat(input.amount), input.category);
+        break;
+      case "get_spending_summary":
+        result = getSpendingSummary();
+        break;
+      default:
+        result = { error: `Unknown tool: ${name}` };
     }
-    case "fetch_rosa_bill":
-      return await fetchRosaBill();
-    case "fetch_and_audit_bill":
-      return await fetchAndAuditBill();
-    case "check_drug_interactions":
-      return await checkDrugInteractions(input.medications);
-    case "pay_for_medication":
-      return await payForMedication(
-        input.pharmacy_id,
-        input.pharmacy_name,
-        input.drug_name,
-        parseFloat(input.amount),
-      );
-    case "pay_bill":
-      return await payBill(
-        input.provider_id,
-        input.provider_name,
-        input.description,
-        parseFloat(input.amount),
-      );
-    case "check_spending_policy":
-      return checkSpendingPolicy(parseFloat(input.amount), input.category);
-    case "get_spending_summary":
-      return getSpendingSummary();
-    default:
-      return { error: `Unknown tool: ${name}` };
+    agentToolCallsTotal.inc({ tool: name, status: "success" });
+    return result;
+  } catch (err: any) {
+    agentToolCallsTotal.inc({ tool: name, status: "error" });
+    throw err;
   }
 }
 
 async function runAgent(task: string) {
   const userTask = _scrubSession ? scrubText(task, _scrubSession) : task;
+  const runId = `run-${getRequestId() ?? Date.now()}`;
+  setAgentRunId(runId);
+
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: SCRUBBED_SYSTEM_PROMPT },
     { role: "user", content: userTask },
@@ -1067,9 +1101,11 @@ app.post("/agent/run", async (req, res) => {
   logger.info({ task, suspicious: validation.suspicious }, "agent task received");
   try {
     const result = await runAgent(task);
+    agentRunsTotal.inc({ status: "success" });
     logger.info({ toolCalls: result.toolCalls.length, truncated: result.truncated }, "agent task complete");
     res.json(result);
   } catch (err: any) {
+    agentRunsTotal.inc({ status: "error" });
     res.status(500).json({ error: err.message });
   }
 });
