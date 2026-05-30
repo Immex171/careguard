@@ -18,6 +18,14 @@ import { logger } from "../shared/logger.ts";
 import { validateTask, getSuspiciousTaskCount } from "../shared/task-validation.ts";
 import { appendAuditEntry } from "../shared/audit-log.ts";
 import { buildScrubSession, scrubText } from "../shared/prompt-scrub.ts";
+import { requestContextMiddleware, setAgentRunId, getRequestId } from "../shared/request-context.ts";
+import { requestLoggerMiddleware } from "../shared/request-logger.ts";
+import {
+  metricsHandler,
+  agentRunsTotal,
+  agentToolCallsTotal,
+  agentLlmTokensTotal,
+} from "../shared/metrics.ts";
 import {
   comparePharmacyPrices,
   auditBill,
@@ -100,47 +108,50 @@ const LLM_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = TOOL_DEFINITIONS
 
 // Execute a tool call
 async function executeTool(name: string, input: any): Promise<any> {
-  switch (name) {
-    case "compare_pharmacy_prices": return await comparePharmacyPrices(input.drug_name, input.zip_code);
-    case "audit_medical_bill": {
-      let items;
-      if (typeof input.line_items_json === "string") {
-        try {
-          items = JSON.parse(input.line_items_json);
-        } catch (e: any) {
-          const sample = input.line_items_json.slice(0, 200);
-          return { ok: false, reason: "INVALID_LINE_ITEMS_JSON", sample, error: e.message };
+  try {
+    let result: any;
+    switch (name) {
+      case "compare_pharmacy_prices": result = await comparePharmacyPrices(input.drug_name, input.zip_code); break;
+      case "audit_medical_bill": {
+        let items;
+        if (typeof input.line_items_json === "string") {
+          try {
+            items = JSON.parse(input.line_items_json);
+          } catch (e: any) {
+            const sample = input.line_items_json.slice(0, 200);
+            agentToolCallsTotal.inc({ tool: name, status: "error" });
+            return { ok: false, reason: "INVALID_LINE_ITEMS_JSON", sample, error: e.message };
+          }
+        } else {
+          items = input.line_items || input.line_items_json;
         }
-      } else {
-        items = input.line_items || input.line_items_json;
+        result = await auditBill(items);
+        break;
       }
-      return await auditBill(items);
+      case "fetch_rosa_bill": result = await fetchRosaBill(); break;
+      case "fetch_and_audit_bill": result = await fetchAndAuditBill(); break;
+      case "check_drug_interactions": result = await checkDrugInteractions(input.medications); break;
+      case "pay_for_medication": result = await payForMedication(input.pharmacy_id, input.pharmacy_name, input.drug_name, parseFloat(input.amount)); break;
+      case "pay_bill": result = await payBill(input.provider_id, input.provider_name, input.description, parseFloat(input.amount)); break;
+      case "check_spending_policy": result = checkSpendingPolicy(parseFloat(input.amount), input.category); break;
+      case "get_spending_summary": result = getSpendingSummary(); break;
+      default: result = { error: `Unknown tool: ${name}` };
     }
-    case "fetch_rosa_bill": return await fetchRosaBill();
-    case "fetch_and_audit_bill": return await fetchAndAuditBill();
-    case "check_drug_interactions": return await checkDrugInteractions(input.medications);
-    case "pay_for_medication": return await payForMedication(input.pharmacy_id, input.pharmacy_name, input.drug_name, parseFloat(input.amount));
-    case "pay_bill": return await payBill(input.provider_id, input.provider_name, input.description, parseFloat(input.amount));
-    case "check_spending_policy": return checkSpendingPolicy(parseFloat(input.amount), input.category);
-    case "get_spending_summary": return getSpendingSummary();
-    default: return { error: `Unknown tool: ${name}` };
+    agentToolCallsTotal.inc({ tool: name, status: "success" });
+    return result;
+  } catch (err: any) {
+    agentToolCallsTotal.inc({ tool: name, status: "error" });
+    throw err;
   }
 }
 
-// LLM token tracking
-interface TokenUsage {
-  promptTokens: number;
-  completionTokens: number;
-  model: string;
-  timestamp: number;
-}
-const llmTokenHistory: TokenUsage[] = [];
-let totalPromptTokens = 0;
-let totalCompletionTokens = 0;
 
 // Run the agent with a task — full agentic loop
 async function runAgent(task: string) {
   const userTask = _scrubSession ? scrubText(task, _scrubSession) : task;
+  const runId = `run-${getRequestId() ?? Date.now()}`;
+  setAgentRunId(runId);
+
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: SCRUBBED_SYSTEM_PROMPT },
     { role: "user", content: userTask },
@@ -184,9 +195,8 @@ async function runAgent(task: string) {
       const completionTokens = response.usage.completion_tokens || 0;
       llmUsage.promptTokens += promptTokens;
       llmUsage.completionTokens += completionTokens;
-      totalPromptTokens += promptTokens;
-      totalCompletionTokens += completionTokens;
-      llmTokenHistory.push({ promptTokens, completionTokens, model: LLM_MODEL, timestamp: Date.now() });
+      agentLlmTokensTotal.inc({ kind: "prompt" }, promptTokens);
+      agentLlmTokensTotal.inc({ kind: "completion" }, completionTokens);
     }
 
     const choice = response.choices[0];
@@ -246,76 +256,18 @@ async function runAgent(task: string) {
   return { response: finalResponse, toolCalls, spending: getSpendingSummary(), llmUsage, truncated };
 }
 
-// Metrics endpoint for Prometheus/Grafana
-app.get("/metrics", (_req, res) => {
-  const tracker = getSpendingTracker();
-  const pendingCount = tracker.transactions.filter((t: any) => t.status === "pending").length;
-  const completedCount = tracker.transactions.filter((t: any) => t.status === "completed").length;
-  const failedCount = tracker.transactions.filter((t: any) => t.status === "rejected").length;
-
-  const now = Date.now();
-  const last24h = llmTokenHistory.filter((t) => now - t.timestamp < 86400000);
-  const tokens24h = last24h.reduce((acc, t) => ({ prompt: acc.prompt + t.promptTokens, completion: acc.completion + t.completionTokens }), { prompt: 0, completion: 0 });
-
-  const groqPricing = { prompt: 0.00000059, completion: 0.00000139 }; // Groq llama-3.3-70b pricing per token
-  const estimatedCost = (totalPromptTokens * groqPricing.prompt) + (totalCompletionTokens * groqPricing.completion);
-
-  res.set("Content-Type", "text/plain");
-  res.send(`# HELP agent_runs_total Total agent runs
-# TYPE agent_runs_total counter
-agent_runs_total ${agentRuns}
-
-# HELP agent_llm_tokens_total Total LLM tokens used
-# TYPE agent_llm_tokens_total counter
-agent_llm_tokens_total{pind="prompt"} ${totalPromptTokens}
-agent_llm_tokens_total{kind="completion"} ${totalCompletionTokens}
-
-# HELP agent_llm_tokens_24h LLM tokens used in last 24h
-# TYPE agent_llm_tokens_24h gauge
-agent_llm_tokens_24h{pind="prompt"} ${tokens24h.prompt}
-agent_llm_tokens_24h{kind="completion"} ${tokens24h.completion}
-
-# HELP agent_llm_cost_usd Estimated LLM cost in USD
-# TYPE agent_llm_cost_usd gauge
-agent_llm_cost_usd ${estimatedCost.toFixed(4)}
-
-# HELP agent_transactions_total Total transactions by status
-# TYPE agent_transactions_total counter
-agent_transactions_total{status="completed"} ${completedCount}
-agent_transactions_total{status="pending"} ${pendingCount}
-agent_transactions_total{status="rejected"} ${failedCount}
-
-# HELP agent_spending_usd Spending by category
-# TYPE agent_spending_usd gauge
-agent_spending_usd{category="medications"} ${tracker.medications}
-agent_spending_usd{category="bills"} ${tracker.bills}
-agent_spending_usd{category="service_fees"} ${tracker.serviceFees}
-
-# HELP agent_stellar_tx_success_total Successful Stellar transactions
-# TYPE agent_stellar_tx_success_total counter
-agent_stellar_tx_success_total ${completedCount}
-
-# HELP agent_tool_call_cap_hits_total Times per-run tool call cap was exceeded
-# TYPE agent_tool_call_cap_hits_total counter
-agent_tool_call_cap_hits_total ${toolCallCapHitsTotal}
-
-# HELP agent_suspicious_task_total Tasks flagged by input validation blocklist
-# TYPE agent_suspicious_task_total counter
-agent_suspicious_task_total ${getSuspiciousTaskCount()}
-`);
-});
-
-let agentRuns = 0;
-
-// Per-run tool call cap (issue #90)
-const MAX_TOOL_CALLS_PER_RUN = parseInt(process.env.MAX_TOOL_CALLS_PER_RUN || "30", 10);
-let toolCallCapHitsTotal = 0;
-
 // Express API
 const app = express();
 applySecurityMiddleware(app);
 app.use(createCorsMiddleware());
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT ?? "20kb" }));
+app.use(requestContextMiddleware());
+app.use(requestLoggerMiddleware());
+app.get("/metrics", metricsHandler());
+
+// Per-run tool call cap
+const MAX_TOOL_CALLS_PER_RUN = parseInt(process.env.MAX_TOOL_CALLS_PER_RUN || "30", 10);
+let toolCallCapHitsTotal = 0;
 
 let agentPaused = false;
 
@@ -434,13 +386,14 @@ app.post("/agent/run", async (req, res) => {
 
   const task = validation.task!;
   logger.info({ task, suspicious: validation.suspicious }, "agent task received");
-  agentRuns++;
 
   try {
     const result = await runAgent(task);
+    agentRunsTotal.inc({ status: "success" });
     logger.info({ toolCalls: result.toolCalls.length, truncated: result.truncated, promptTokens: result.llmUsage.promptTokens, completionTokens: result.llmUsage.completionTokens }, "agent task complete");
     res.json(result);
   } catch (err: any) {
+    agentRunsTotal.inc({ status: "error" });
     logger.error({ err: err.message }, "agent run error");
     res.status(500).json({ error: err.message });
   }

@@ -19,6 +19,8 @@ import { applyX402Middleware, NETWORK, OZ_FACILITATOR_URL } from "../../shared/x
 import { createCorsMiddleware } from "../../shared/cors.ts";
 import { applySecurityMiddleware } from "../../shared/security-middleware.ts";
 import { logger } from "../../shared/logger.ts";
+import { requestContextMiddleware } from "../../shared/request-context.ts";
+import { requestLoggerMiddleware } from "../../shared/request-logger.ts";
 
 const PORT = parseInt(process.env.BILL_AUDIT_API_PORT || "3002");
 const PAY_TO = process.env.BILL_PROVIDER_PUBLIC_KEY;
@@ -104,6 +106,8 @@ const app = express();
 applySecurityMiddleware(app);
 app.use(createCorsMiddleware());
 app.use(express.json({ limit: process.env.BILL_AUDIT_BODY_LIMIT ?? "256kb" }));
+app.use(requestContextMiddleware());
+app.use(requestLoggerMiddleware());
 
 app.get("/", (_req, res) => {
   res.json({
