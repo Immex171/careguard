@@ -118,6 +118,27 @@ const agentKeypair = Keypair.fromSecret(env.data.AGENT_SECRET_KEY);
 const MAX_TOOL_CALLS_PER_RUN = parseInt(process.env.MAX_TOOL_CALLS_PER_RUN || "30", 10);
 let toolCallCapHitsTotal = 0;
 
+// --- Mutable profile (issue #79) ---
+const _DEFAULT_PROFILE = {
+  recipient: {
+    name: "Rosa Garcia",
+    age: 78,
+    medications: ["Lisinopril", "Metformin", "Atorvastatin", "Amlodipine"],
+    doctor: "Dr. Chen, General Hospital",
+    insurance: "Medicare Part D",
+  },
+  caregiver: {
+    name: "Maria Garcia",
+    relationship: "Daughter",
+    location: "Phoenix, AZ (800 miles from Rosa)",
+    notifications: "Email + SMS",
+  },
+};
+let _profileData = {
+  recipient: { ..._DEFAULT_PROFILE.recipient, medications: [..._DEFAULT_PROFILE.recipient.medications] },
+  caregiver: { ..._DEFAULT_PROFILE.caregiver },
+};
+
 // --- Express App ---
 const app = express();
 const sentry = await initSentry({ service: "careguard-server" });
@@ -191,6 +212,23 @@ app.get("/ready", async (_req, res) => {
 
   const allOk = Object.values(checks).every((v) => v === true);
   res.status(allOk ? 200 : 503).json({ status: allOk ? "ok" : "degraded", checks });
+});
+
+// --- Profile (issue #79) ---
+app.get("/agent/profile", (_req, res) => { res.json(_profileData); });
+
+app.patch("/agent/profile", (req, res) => {
+  const { recipient, caregiver } = req.body ?? {};
+  if (recipient && typeof recipient === "object") {
+    _profileData.recipient = { ..._profileData.recipient, ...recipient };
+    if (Array.isArray(recipient.medications)) {
+      _profileData.recipient.medications = recipient.medications;
+    }
+  }
+  if (caregiver && typeof caregiver === "object") {
+    _profileData.caregiver = { ..._profileData.caregiver, ...caregiver };
+  }
+  res.json(_profileData);
 });
 
 // ============================================================
@@ -1078,8 +1116,19 @@ app.get("/agent/transactions", (req, res) => {
   });
 });
 app.post("/agent/policy", (req, res) => {
-  setSpendingPolicy(req.body);
-  res.json({ success: true, policy: req.body });
+  const body = req.body;
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "Invalid policy" });
+  }
+  const fields = ["dailyLimit", "monthlyLimit", "medicationMonthlyBudget", "billMonthlyBudget", "approvalThreshold"] as const;
+  const errors: string[] = [];
+  for (const f of fields) {
+    const v = body[f];
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) errors.push(`${f} must be a positive finite number`);
+  }
+  if (errors.length > 0) return res.status(400).json({ error: "Invalid policy", details: errors });
+  setSpendingPolicy(body);
+  res.json({ success: true, policy: body });
 });
 app.post("/agent/reset", (_req, res) => {
   resetSpendingTracker();

@@ -98,5 +98,15 @@ export type RecipientProfile = {
   name: string;
   age?: number;
   facility?: string;
+  medications?: string[];
+  doctor?: string;
+  insurance?: string;
+};
+
+export type CaregiverProfile = {
+  name: string;
+  relationship?: string;
+  location?: string;
+  notifications?: string;
 };
 

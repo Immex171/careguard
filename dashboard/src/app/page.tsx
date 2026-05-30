@@ -20,7 +20,7 @@ import { useAgentState } from "../hooks/use-agent-state";
 import { useProfile } from "../lib/useProfile";
 
 export default function Dashboard() {
-  const { recipient } = useProfile();
+  const { recipient, caregiver, updateProfile } = useProfile();
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
@@ -128,9 +128,11 @@ export default function Dashboard() {
         {activeTab === "settings" && (
           <SettingsTab
             recipient={recipient}
+            caregiver={caregiver}
             agentInfo={state.agentInfo}
             agentPaused={state.agentPaused}
             onTogglePause={state.togglePause}
+            onUpdateProfile={updateProfile}
           />
         )}
       </div>

@@ -445,7 +445,26 @@ const DEFAULT_PROFILE = {
   },
 };
 
-app.get("/agent/profile", (_req, res) => { res.json(DEFAULT_PROFILE); });
+let profileData = {
+  recipient: { ...DEFAULT_PROFILE.recipient, medications: [...DEFAULT_PROFILE.recipient.medications] },
+  caregiver: { ...DEFAULT_PROFILE.caregiver },
+};
+
+app.get("/agent/profile", (_req, res) => { res.json(profileData); });
+
+app.patch("/agent/profile", (req, res) => {
+  const { recipient, caregiver } = req.body ?? {};
+  if (recipient && typeof recipient === "object") {
+    profileData.recipient = { ...profileData.recipient, ...recipient };
+    if (Array.isArray(recipient.medications)) {
+      profileData.recipient.medications = recipient.medications;
+    }
+  }
+  if (caregiver && typeof caregiver === "object") {
+    profileData.caregiver = { ...profileData.caregiver, ...caregiver };
+  }
+  res.json(profileData);
+});
 
 // Startup: verify agent wallet has USDC balance
 async function verifyWallet() {
