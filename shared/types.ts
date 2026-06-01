@@ -52,6 +52,12 @@ export interface SpendingPolicy {
   medicationMonthlyBudget: number;
   billMonthlyBudget: number;
   approvalThreshold: number; // require caregiver approval above this amount
+  notifications?: {
+    email: boolean;
+    sms: boolean;
+    emailAddress?: string;
+    phoneNumber?: string;
+  };
 }
 
 export interface Transaction {

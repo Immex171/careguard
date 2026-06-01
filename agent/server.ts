@@ -43,6 +43,10 @@ import {
   setSpendingPolicy,
   getSpendingTracker,
   resetSpendingTracker,
+  generateDisputeLetter,
+  checkAdherence,
+  setCurrentRecipient,
+  getCurrentRecipient,
   TOOL_DEFINITIONS,
 } from "./tools.ts";
 
@@ -62,21 +66,28 @@ const llm = new OpenAI({
 const agentKeypair = Keypair.fromSecret(process.env.AGENT_SECRET_KEY);
 const horizonServer = new Horizon.Server("https://horizon-testnet.stellar.org");
 
-const SYSTEM_PROMPT = `You are CareGuard, an AI agent that manages healthcare spending for elderly care recipients on the Stellar blockchain. You work on behalf of a family caregiver to ensure their loved one gets the best prices on medications and catches errors in medical bills.
+function buildSystemPrompt(recipientName: string, recipientAge: number, caregiverName: string): string {
+  return `You are CareGuard, an AI agent that manages healthcare spending for elderly care recipients on the Stellar blockchain. You work on behalf of a family caregiver to ensure their loved one gets the best prices on medications and catches errors in medical bills.
 
 Your responsibilities:
 1. MEDICATION MANAGEMENT: Compare prices across pharmacies and order from the cheapest. Always check drug interactions before ordering.
 2. BILL AUDITING: Scan medical bills for errors (80% of bills have them). Identify duplicates, upcoding, and overcharges.
 3. PAYMENT EXECUTION: Pay for medications and bills within the spending policy set by the caregiver. Never exceed policy limits.
-4. TRANSPARENCY: Report all savings, errors found, and payments made. Every payment creates a real Stellar transaction.
+4. DISPUTE RESOLUTION: When audit finds overcharges, generate a dispute letter with findings, fair-market rates, and CPT codes.
+5. ADHERENCE TRACKING: After ordering medications, check that the recipient actually takes them. Flag persistent skips.
+6. NOTIFICATIONS: Alert the caregiver about significant payments, errors found, policy changes, and agent status.
+7. TRANSPARENCY: Report all savings, errors found, and payments made. Every payment creates a real Stellar transaction.
 
 IMPORTANT RULES:
 - Always check spending policy BEFORE attempting any payment
 - If a payment requires caregiver approval, flag it and wait — do not proceed
 - If a payment is blocked by policy, explain why clearly
 - When comparing medication prices, compare ALL medications at once, then check interactions, then order from cheapest
-- When auditing a bill, use fetch_and_audit_bill which fetches Rosa's bill and audits it in one step. Never invent bill data.
+- When auditing a bill, use fetch_and_audit_bill which fetches the bill and audits it in one step. Never invent bill data.
+- After paying for medication, adherence tracking is automatic. Use check_adherence to check status.
+- When audit finds overcharges, use generate_dispute_letter to create a formal dispute.
 - Report the total savings found and the cost of the agent's API queries
+- All tool calls accept an optional recipient_id parameter for multi-recipient support
 
 PAYMENT PROTOCOLS:
 - API queries (pharmacy prices, bill audits, drug interactions) are paid via x402 on Stellar ($0.001-$0.01 per query)
@@ -84,17 +95,29 @@ PAYMENT PROTOCOLS:
 - Bill payments are direct Stellar USDC transfers
 - All transactions settle on Stellar testnet with real USDC
 
-Current care recipient: Rosa Garcia (age 78)
-Caregiver: Maria Garcia (daughter)`;
+Current care recipient: ${recipientName} (age ${recipientAge})
+Caregiver: ${caregiverName}`;
+}
+
+const SYSTEM_PROMPT = buildSystemPrompt("Rosa Garcia", 78, "Maria Garcia");
 
 // PHI scrubbing — active unless LLM_PII_SCRUB=false (e.g. provider has a BAA)
 const _piiScrub = process.env.LLM_PII_SCRUB !== "false";
-const _scrubSession = _piiScrub
-  ? buildScrubSession(["Rosa Garcia"], ["Maria Garcia"])
-  : null;
-const SCRUBBED_SYSTEM_PROMPT = _scrubSession
+function buildScrubSessionForProfile() {
+  if (!_piiScrub) return null;
+  return buildScrubSession([profileData.recipient.name], [profileData.caregiver.name]);
+}
+let _scrubSession = buildScrubSessionForProfile();
+let SCRUBBED_SYSTEM_PROMPT = _scrubSession
   ? scrubText(SYSTEM_PROMPT, _scrubSession)
   : SYSTEM_PROMPT;
+
+function rebuildScrubbedSystemPrompt() {
+  _scrubSession = buildScrubSessionForProfile();
+  SCRUBBED_SYSTEM_PROMPT = _scrubSession
+    ? scrubText(SYSTEM_PROMPT, _scrubSession)
+    : SYSTEM_PROMPT;
+}
 
 // Convert tool definitions to OpenAI-compatible function format
 const LLM_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = TOOL_DEFINITIONS.map((t) => ({
@@ -142,6 +165,24 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       case "check_spending_policy": result = checkSpendingPolicy(parseFloat(input.amount), input.category); break;
       case "get_spending_summary": result = getSpendingSummary(); break;
       case "get_wallet_balance": result = await getWalletBalance(); break;
+      case "generate_dispute_letter": {
+        const billId = String(input.bill_id || "");
+        const providerName = String(input.provider_name || "");
+        const errorIds = Array.isArray(input.error_ids) ? input.error_ids.map(String) : [];
+        const profile = profileData;
+        result = generateDisputeLetter({
+          billId,
+          recipientName: profile.recipient.name,
+          providerName,
+          errorIds,
+          auditFindings: [],
+          caregiverName: profile.caregiver.name,
+          caregiverEmail: "",
+          caregiverPhone: "",
+        });
+        break;
+      }
+      case "check_adherence": result = checkAdherence(String(input.recipient_id || undefined)); break;
       default: result = { error: `Unknown tool: ${name}` };
     }
     agentToolCallsTotal.inc({ tool: name, status: "success" });
@@ -155,6 +196,10 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
 
 // Run the agent with a task — full agentic loop
 async function runAgent(task: string) {
+  // Set current recipient based on profile
+  const recipientId = profileData.recipient.name.toLowerCase().replace(/\s+/g, "-");
+  setCurrentRecipient(recipientId);
+
   const userTask = _scrubSession ? scrubText(task, _scrubSession) : task;
   const runId = `run-${getRequestId() ?? Date.now()}`;
   setAgentRunId(runId);
@@ -392,8 +437,9 @@ app.get("/", (_req, res) => {
     network: "stellar:testnet",
     llm: `${LLM_BASE_URL} / ${LLM_MODEL}`,
     agentWallet: agentKeypair.publicKey(),
-    careRecipient: "Rosa Garcia",
-    caregiver: "Maria Garcia",
+    careRecipient: profileData.recipient.name,
+    caregiver: profileData.caregiver.name,
+    recipientId: getCurrentRecipient(),
     paused: agentPaused,
   });
 });
@@ -444,7 +490,16 @@ function validatePolicyPayload(body: any): { ok: true; policy: any } | { ok: fal
     errors.push("approvalThreshold cannot exceed dailyLimit");
   }
   if (errors.length > 0) return { ok: false, errors };
-  const policy = Object.fromEntries(fields.map((f) => [f, body[f]]));
+  const policy: any = Object.fromEntries(fields.map((f) => [f, body[f]]));
+  // Allow optional notifications preferences
+  if (body.notifications && typeof body.notifications === "object") {
+    policy.notifications = {
+      email: Boolean(body.notifications.email),
+      sms: Boolean(body.notifications.sms),
+      emailAddress: typeof body.notifications.emailAddress === "string" ? body.notifications.emailAddress : undefined,
+      phoneNumber: typeof body.notifications.phoneNumber === "string" ? body.notifications.phoneNumber : undefined,
+    };
+  }
   return { ok: true, policy };
 }
 
@@ -490,6 +545,10 @@ app.patch("/agent/profile", (req, res) => {
   if (caregiver && typeof caregiver === "object") {
     profileData.caregiver = { ...profileData.caregiver, ...caregiver };
   }
+  // Rebuild system prompt with new recipient/caregiver names
+  setCurrentRecipient(profileData.recipient.name.toLowerCase().replace(/\s+/g, "-"));
+  // Rebuild scrubbed prompt
+  rebuildScrubbedSystemPrompt();
   res.json(profileData);
 });
 

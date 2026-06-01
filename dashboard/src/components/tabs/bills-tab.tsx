@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { downloadBillAuditPDF } from "../../app/pdf";
+import { downloadBillAuditPDF, downloadDisputeLetterPDF } from "../../app/pdf";
 import {
   BillAuditResultSchema,
   type RecipientProfile,
@@ -12,9 +12,10 @@ import type { AgentResult } from "../types";
 export interface BillsTabProps {
   agentResult: AgentResult | null;
   recipient: RecipientProfile;
+  caregiverName?: string;
 }
 
-export function BillsTab({ agentResult, recipient }: BillsTabProps) {
+export function BillsTab({ agentResult, recipient, caregiverName }: BillsTabProps) {
   const [showErrorsOnly, setShowErrorsOnly] = useState(false);
 
   const auditCalls = agentResult?.toolCalls.filter(
@@ -52,6 +53,29 @@ export function BillsTab({ agentResult, recipient }: BillsTabProps) {
                 >
                   Download PDF
                 </button>
+                {t.result.errorCount > 0 && (
+                  <button
+                    onClick={() => {
+                      const errors = t.result.lineItems.filter((item: any) => item.status !== "valid");
+                      downloadDisputeLetterPDF({
+                        billId: `bill-${Date.now()}`,
+                        recipientName: recipient.name,
+                        providerName: recipient.facility || "General Hospital",
+                        auditFindings: errors.map((item: any) => ({
+                          description: item.description,
+                          cptCode: item.cptCode,
+                          chargedAmount: item.chargedAmount,
+                          fairMarketRate: item.suggestedAmount || item.chargedAmount * 0.7,
+                          overcharge: item.chargedAmount - (item.suggestedAmount || item.chargedAmount * 0.7),
+                        })),
+                        caregiverName: caregiverName || "Caregiver",
+                      });
+                    }}
+                    className="px-3 py-1.5 bg-red-50 text-red-700 rounded-lg text-xs font-medium hover:bg-red-100 active:bg-red-200 cursor-pointer transition-all"
+                  >
+                    Dispute
+                  </button>
+                )}
                 <span
                   className={`px-3 py-1 rounded-full text-xs font-medium ${
                     t.result.errorCount > 0

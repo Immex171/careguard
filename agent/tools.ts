@@ -1,11 +1,16 @@
 /**
  * CareGuard Agent Tools — Real payment integrations on Stellar testnet
  *
+ * Supports multiple care recipients via per-recipient data directories.
+ *   data/recipients/<recipientId>/spending.json
+ *   data/recipients/<recipientId>/orders.json
+ *   data/recipients/<recipientId>/policy.json
+ *
  * x402 client: Signs Soroban auth entries, pays USDC per API query via OZ facilitator
  * MPP client: Signs Soroban transfers, pays pharmacies via MPP charge mode
  * Stellar USDC: Direct USDC transfers for bill payments via Horizon
  * Spending policy: Persisted to file, enforced before every payment.
- *   ⚠️  DO NOT COMMIT data/spending.json or data/orders.json — they contain
+ *   ⚠️  DO NOT COMMIT files under data/recipients/ — they contain
  *   live balances and transaction history. Add them to .gitignore and never
  *   include them in a PR. See data/README.md for details.
  */
@@ -22,6 +27,7 @@ import type { SpendingPolicy, Transaction } from "../shared/types.ts";
 import { SPENDING_TIMEZONE, getLocalDateStr } from "./tz.ts";
 export { SPENDING_TIMEZONE, getLocalDateStr };
 import { appendAuditEntry } from "../shared/audit-log.ts";
+import { notify } from "../shared/notifications.ts";
 import {
   x402SettlementsTotal,
   paymentsUsdcTotal,
@@ -125,11 +131,53 @@ const mppClient = Mppx.create({
   polyfill: false,
 });
 
-// --- Persistent spending tracker ---
+// --- Per-recipient data directories (Issue #261) ---
 const DATA_DIR = new URL("../data", import.meta.url).pathname;
-const SPENDING_FILE = `${DATA_DIR}/spending.json`;
+
+let currentRecipientId = "rosa";
+
+export function setCurrentRecipient(recipientId: string) {
+  currentRecipientId = recipientId;
+  const dir = getRecipientDir(recipientId);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+export function getCurrentRecipient() { return currentRecipientId; }
+
+function getRecipientDir(recipientId: string): string {
+  return `${DATA_DIR}/recipients/${recipientId}`;
+}
+function getSpendingFile(recipientId?: string): string {
+  return `${getRecipientDir(recipientId || currentRecipientId)}/spending.json`;
+}
+function getPolicyFile(recipientId?: string): string {
+  return `${getRecipientDir(recipientId || currentRecipientId)}/policy.json`;
+}
+function getOrdersFile(recipientId?: string): string {
+  return `${getRecipientDir(recipientId || currentRecipientId)}/orders.json`;
+}
+
+// Migrate legacy flat files to per-recipient structure (one-time)
+function migrateLegacyData() {
+  const legacySpending = `${DATA_DIR}/spending.json`;
+  const legacyOrders = `${DATA_DIR}/orders.json`;
+  const rosaDir = getRecipientDir("rosa");
+  if (!existsSync(rosaDir)) mkdirSync(rosaDir, { recursive: true });
+  if (existsSync(legacySpending) && !existsSync(`${rosaDir}/spending.json`)) {
+    const data = readFileSync(legacySpending, "utf-8");
+    writeFileSync(`${rosaDir}/spending.json`, data);
+  }
+  if (existsSync(legacyOrders) && !existsSync(`${rosaDir}/orders.json`)) {
+    const data = readFileSync(legacyOrders, "utf-8");
+    writeFileSync(`${rosaDir}/orders.json`, data);
+  }
+  if (!existsSync(`${rosaDir}/policy.json`)) {
+    writeFileSync(`${rosaDir}/policy.json`, JSON.stringify(DEFAULT_POLICY, null, 2));
+  }
+}
+migrateLegacyData();
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+if (!existsSync(getRecipientDir(currentRecipientId))) mkdirSync(getRecipientDir(currentRecipientId), { recursive: true });
 
 interface SpendingTracker {
   medications: number;
@@ -138,18 +186,18 @@ interface SpendingTracker {
   transactions: Transaction[];
 }
 
-function loadSpending(): SpendingTracker {
-  if (!existsSync(SPENDING_FILE)) return { medications: 0, bills: 0, serviceFees: 0, transactions: [] };
-  return JSON.parse(readFileSync(SPENDING_FILE, "utf-8"));
+function loadSpending(recipientId?: string): SpendingTracker {
+  const file = getSpendingFile(recipientId);
+  if (!existsSync(file)) return { medications: 0, bills: 0, serviceFees: 0, transactions: [] };
+  return JSON.parse(readFileSync(file, "utf-8"));
 }
 
-function saveSpending(data: SpendingTracker) {
-  writeFileSync(SPENDING_FILE, JSON.stringify(data, null, 2));
+function saveSpending(data: SpendingTracker, recipientId?: string) {
+  const file = getSpendingFile(recipientId);
+  writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
 let spendingTracker = loadSpending();
-
-const POLICY_FILE = `${DATA_DIR}/policy.json`;
 
 const MAX_PAYMENT = 1000;
 const MAX_ERROR_LENGTH = 500;
@@ -164,16 +212,18 @@ const DEFAULT_POLICY: SpendingPolicy = {
   medicationMonthlyBudget: 300,
   billMonthlyBudget: 500,
   approvalThreshold: 75,
+  notifications: { email: false, sms: false },
 };
 
-function loadPolicy(): SpendingPolicy {
-  if (!existsSync(POLICY_FILE)) return { ...DEFAULT_POLICY };
-  try { return JSON.parse(readFileSync(POLICY_FILE, "utf-8")); }
+function loadPolicy(recipientId?: string): SpendingPolicy {
+  const file = getPolicyFile(recipientId);
+  if (!existsSync(file)) return { ...DEFAULT_POLICY };
+  try { return JSON.parse(readFileSync(file, "utf-8")); }
   catch { return { ...DEFAULT_POLICY }; }
 }
 
-function savePolicy(policy: SpendingPolicy) {
-  writeFileSync(POLICY_FILE, JSON.stringify(policy, null, 2));
+function savePolicy(policy: SpendingPolicy, recipientId?: string) {
+  writeFileSync(getPolicyFile(recipientId), JSON.stringify(policy, null, 2));
 }
 
 let currentPolicy: SpendingPolicy = loadPolicy();
@@ -189,6 +239,11 @@ export function setSpendingPolicy(policy: SpendingPolicy) {
       previous: { ...previous },
       current: { ...policy },
     },
+  });
+  notify({
+    level: "info",
+    title: "Spending Policy Updated",
+    description: `Daily: $${policy.dailyLimit}, Monthly: $${policy.monthlyLimit}, Meds: $${policy.medicationMonthlyBudget}, Bills: $${policy.billMonthlyBudget}, Approval: $${policy.approvalThreshold}`,
   });
 }
 export function getSpendingTracker() { return { ...spendingTracker, policy: currentPolicy }; }
@@ -446,7 +501,7 @@ export function checkSpendingPolicy(amount: number, category: "medications" | "b
 }
 
 // --- Tool: Pay for medication via MPP Charge (real Stellar payment) ---
-export async function payForMedication(pharmacyId: string, pharmacyName: string, drugName: string, amount: number, skipApproval: boolean = false) {
+export async function payForMedication(pharmacyId: string, pharmacyName: string, drugName: string, amount: number, skipApproval: boolean = false, daysSupply: number = 30) {
   if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_PAYMENT) {
     return { success: false, error: `Invalid payment amount: $${amount}. Amount must be a positive finite number <= $${MAX_PAYMENT}.` };
   }
@@ -522,6 +577,25 @@ export async function payForMedication(pharmacyId: string, pharmacyName: string,
   agentTransactionsTotal.inc({ status: "completed" });
   agentSpendingUsd.set({ category: "medications" }, spendingTracker.medications);
   saveSpending(spendingTracker);
+
+  // Schedule adherence reminder (Issue #264)
+  const reminderDate = new Date(Date.now() + daysSupply * 24 * 60 * 60 * 1000).toISOString();
+  appendAdherenceEntry({
+    recipientId: currentRecipientId,
+    reminderDate,
+    drug: drugName,
+    orderId: mppOrderId || tx.id,
+  });
+
+  // Notify on significant payment (Issue #265)
+  if (amount > currentPolicy.approvalThreshold) {
+    notify({
+      level: "info",
+      title: "Medication Payment Made",
+      description: `$${amount.toFixed(2)} paid for ${drugName} at ${pharmacyName}. Adherence reminder scheduled for ${new Date(reminderDate).toLocaleDateString()}.`,
+      context: { recipientId: currentRecipientId, txId: tx.id, stellarTxHash },
+    });
+  }
 
   return { success: true, transaction: tx };
 }
@@ -612,6 +686,16 @@ export async function payBill(providerId: string, providerName: string, descript
   agentSpendingUsd.set({ category: "bills" }, spendingTracker.bills);
   saveSpending(spendingTracker);
 
+  // Notify on significant payment (Issue #265)
+  if (amount > currentPolicy.approvalThreshold) {
+    notify({
+      level: "info",
+      title: "Bill Payment Made",
+      description: `$${amount.toFixed(2)} paid to ${providerName} for ${description}`,
+      context: { recipientId: currentRecipientId, txId: tx.id, stellarTxHash },
+    });
+  }
+
   return { success: true, transaction: tx };
 }
 
@@ -665,6 +749,108 @@ export async function getWalletBalance() {
   }
 }
 
+// --- Tool: Check medication adherence (Issue #264) ---
+export function checkAdherence(recipientId?: string) {
+  const id = recipientId || currentRecipientId;
+  const file = ADHERENCE_FILE;
+  if (!existsSync(file)) {
+    return { pendingReminders: 0, entries: [], flagged: false };
+  }
+  const content = readFileSync(file, "utf-8").trim();
+  if (!content) return { pendingReminders: 0, entries: [], flagged: false };
+
+  const lines = content.split("\n").filter(Boolean);
+  const entries: AdherenceEntry[] = lines.map(l => JSON.parse(l));
+  const recipientEntries = entries.filter(e => e.recipientId === id);
+  const now = new Date();
+  const pending = recipientEntries.filter(e => !e.responded && new Date(e.reminderDate) <= now);
+  const missed = recipientEntries.filter(e => e.responded && e.taken === false);
+  const flagged = recipientEntries.some(e => e.flagged);
+
+  return {
+    pendingReminders: pending.length,
+    totalEntries: recipientEntries.length,
+    pending,
+    missedDoses: missed.length,
+    flagged,
+    lastReminder: recipientEntries.length > 0 ? recipientEntries[recipientEntries.length - 1].reminderDate : null,
+  };
+}
+
+// --- Helper: Load/save orders.json for a recipient ---
+interface OrderRecord {
+  id: string; drug: string; pharmacy: string; amount: number;
+  status: string; timestamp: string; network?: string; protocol?: string;
+}
+function loadOrders(recipientId?: string): OrderRecord[] {
+  const file = getOrdersFile(recipientId);
+  if (!existsSync(file)) return [];
+  return JSON.parse(readFileSync(file, "utf-8"));
+}
+function saveOrders(orders: OrderRecord[], recipientId?: string) {
+  writeFileSync(getOrdersFile(recipientId), JSON.stringify(orders, null, 2));
+}
+
+// --- Tool: Schedule an adherence reminder after pharmacy order (Issue #264) ---
+const ADHERENCE_FILE = `${DATA_DIR}/adherence.jsonl`;
+interface AdherenceEntry {
+  recipientId: string;
+  reminderDate: string;
+  drug: string;
+  orderId: string;
+  responded: boolean;
+  taken: boolean | null;
+  skippedCount: number;
+  flagged: boolean;
+}
+function appendAdherenceEntry(entry: Omit<AdherenceEntry, "responded" | "taken" | "skippedCount" | "flagged">) {
+  const fullEntry: AdherenceEntry = { ...entry, responded: false, taken: null, skippedCount: 0, flagged: false };
+  writeFileSync(ADHERENCE_FILE, JSON.stringify(fullEntry) + "\n", { flag: "a" });
+}
+
+// --- Tool: Generate a dispute letter PDF + email body (Issue #266) ---
+export function generateDisputeLetter(input: {
+  billId: string;
+  recipientName: string;
+  providerName: string;
+  errorIds: string[];
+  auditFindings: Array<{ description: string; cptCode: string; chargedAmount: number; fairMarketRate: number; overcharge: number }>;
+  caregiverName: string;
+  caregiverEmail: string;
+  caregiverPhone: string;
+}): { pdf: string; emailBody: string } {
+  const totalOvercharge = input.auditFindings.reduce((s, f) => s + f.overcharge, 0);
+  const emailBody = `To: ${input.providerName} Billing Department
+Subject: Dispute of Medical Bill #${input.billId} — Overcharge of $${totalOvercharge.toFixed(2)}
+
+Dear ${input.providerName} Billing Department,
+
+I am writing to formally dispute the charges on bill #${input.billId} for ${input.recipientName}.
+
+Our AI audit identified the following ${input.auditFindings.length} error(s):
+
+${input.auditFindings.map((f, i) => `Error ${i + 1}: ${f.description} (CPT: ${f.cptCode})
+  Charged: $${f.chargedAmount.toFixed(2)} | Fair Market Rate: $${f.fairMarketRate.toFixed(2)} | Overcharge: $${f.overcharge.toFixed(2)}`).join("\n\n")}
+
+Total overcharge identified: $${totalOvercharge.toFixed(2)}
+
+We request a corrected bill reflecting the fair market rates.
+
+Please send the corrected bill to:
+${input.caregiverName}
+${input.caregiverEmail}
+${input.caregiverPhone}
+
+Thank you for your prompt attention to this matter.
+
+Sincerely,
+${input.caregiverName}
+CareGuard AI Agent`;
+
+  const pdf = `careguard-dispute-letter-${input.billId}.pdf`;
+  return { pdf, emailBody };
+}
+
 // Claude API tool definitions
 export const TOOL_DEFINITIONS = [
   {
@@ -675,6 +861,7 @@ export const TOOL_DEFINITIONS = [
       properties: {
         drug_name: { type: "string", description: "Name of the medication (e.g., Lisinopril, Metformin)" },
         zip_code: { type: "string", description: "ZIP code for pharmacy location (default: 90210)" },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: ["drug_name"],
     },
@@ -689,6 +876,7 @@ export const TOOL_DEFINITIONS = [
           type: "string",
           description: "JSON string of line items array. Each item: {\"description\":\"...\",\"cptCode\":\"...\",\"quantity\":1,\"chargedAmount\":100}",
         },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: ["line_items_json"],
     },
@@ -700,6 +888,7 @@ export const TOOL_DEFINITIONS = [
       type: "object" as const,
       properties: {
         medications: { type: "array", items: { type: "string" }, description: "List of medication names" },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: ["medications"],
     },
@@ -712,6 +901,8 @@ export const TOOL_DEFINITIONS = [
       properties: {
         pharmacy_id: { type: "string" }, pharmacy_name: { type: "string" },
         drug_name: { type: "string" }, amount: { type: "number" },
+        days_supply: { type: "number", description: "Days supply for adherence tracking (default: 30)" },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: ["pharmacy_id", "pharmacy_name", "drug_name", "amount"],
     },
@@ -724,6 +915,7 @@ export const TOOL_DEFINITIONS = [
       properties: {
         provider_id: { type: "string" }, provider_name: { type: "string" },
         description: { type: "string" }, amount: { type: "number" },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: ["provider_id", "provider_name", "description", "amount"],
     },
@@ -735,39 +927,40 @@ export const TOOL_DEFINITIONS = [
       type: "object" as const,
       properties: {
         amount: { type: "number" }, category: { type: "string", enum: ["medications", "bills"] },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: ["amount", "category"],
     },
   },
   {
     name: "fetch_rosa_bill",
-    description: "Fetch Rosa Garcia's hospital bill from General Hospital. Returns the bill with line items including CPT codes and charged amounts.",
+    description: "Fetch the current care recipient's hospital bill. Returns the bill with line items including CPT codes and charged amounts.",
     input_schema: {
       type: "object" as const,
       properties: {
-        _unused: { type: "string", description: "Not used. Pass empty string." },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: [] as string[],
     },
   },
   {
     name: "fetch_and_audit_bill",
-    description: "Fetch Rosa's hospital bill from General Hospital AND audit it for errors in one step. Pays $0.01 USDC via x402. Returns the audit results with errors found, overcharges, and corrected total. Use this instead of calling fetch_rosa_bill + audit_medical_bill separately.",
+    description: "Fetch the care recipient's hospital bill AND audit it for errors in one step. Pays $0.01 USDC via x402. Returns the audit results with errors found, overcharges, and corrected total. Use this instead of calling fetch_bill + audit_medical_bill separately.",
     input_schema: {
       type: "object" as const,
       properties: {
-        _unused: { type: "string", description: "Not used. Pass empty string." },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: [] as string[],
     },
   },
   {
     name: "get_spending_summary",
-    description: "Get current spending summary: total spent, budget remaining per category, recent transactions with Stellar tx hashes.",
+    description: "Get current spending summary: total spent, budget remaining per category, recent transactions with Stellar tx hashes for the current care recipient.",
     input_schema: {
       type: "object" as const,
       properties: {
-        _unused: { type: "string", description: "Not used. Pass empty string." },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: [] as string[],
     },
@@ -779,6 +972,31 @@ export const TOOL_DEFINITIONS = [
       type: "object" as const,
       properties: {
         _unused: { type: "string", description: "Not used. Pass empty string." },
+      },
+      required: [] as string[],
+    },
+  },
+  {
+    name: "generate_dispute_letter",
+    description: "Generate a dispute letter PDF and email body for a billing error. Use after audit finds overcharges. Letter includes audit findings, CPT codes, fair-market rates, and caregiver contact info.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        bill_id: { type: "string", description: "The disputed bill ID" },
+        provider_name: { type: "string", description: "Provider/hospital name" },
+        error_ids: { type: "array", items: { type: "string" }, description: "List of error IDs or descriptions from the audit" },
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
+      },
+      required: ["bill_id", "provider_name", "error_ids"],
+    },
+  },
+  {
+    name: "check_adherence",
+    description: "Check medication adherence status for the care recipient. Returns pending reminders, missed doses, and any flags for persistent skips.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        recipient_id: { type: "string", description: "Care recipient ID (default: rosa)" },
       },
       required: [] as string[],
     },

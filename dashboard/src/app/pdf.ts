@@ -312,3 +312,99 @@ export function downloadTransactionPDF(
   addFooter(doc);
   doc.save("careguard-transaction-report.pdf");
 }
+
+export function downloadDisputeLetterPDF(
+  params: {
+    billId: string;
+    recipientName: string;
+    providerName: string;
+    auditFindings: Array<{
+      description: string;
+      cptCode?: string;
+      chargedAmount: number;
+      fairMarketRate?: number;
+      overcharge: number;
+    }>;
+    caregiverName: string;
+    caregiverEmail?: string;
+    caregiverPhone?: string;
+  },
+  options?: { theme?: PdfTheme }
+) {
+  const theme = options?.theme ?? DEFAULT_PDF_THEME;
+  const doc: AutoTableDoc = new jsPDF();
+  doc.setProperties({
+    title: "CareGuard Dispute Letter",
+    subject: `Dispute for bill ${params.billId}`,
+    author: "CareGuard",
+    keywords: `${params.recipientName},dispute,${params.billId}`,
+    creator: `CareGuard ${new Date().toISOString()}`,
+  });
+  addHeader(doc, "Medical Bill Dispute Letter", `Bill #${params.billId} — ${params.providerName}`, theme);
+
+  const totalOvercharge = params.auditFindings.reduce((s, f) => s + f.overcharge, 0);
+  const today = new Date().toLocaleDateString();
+
+  let y = 58;
+  doc.setFontSize(10);
+  doc.setTextColor(15, 23, 42);
+  doc.text(`Date: ${today}`, 14, y);
+  y += 6;
+  doc.text(`To: ${params.providerName} Billing Department`, 14, y);
+  y += 6;
+  doc.text(`Re: Dispute of Bill #${params.billId} for ${params.recipientName}`, 14, y);
+  y += 10;
+
+  doc.setFontSize(10);
+  doc.text("Dear Billing Department,", 14, y);
+  y += 6;
+  doc.text(
+    `Our AI-powered audit identified ${params.auditFindings.length} error(s) totaling $${totalOvercharge.toFixed(2)} in overcharges on the above-referenced bill.`,
+    14,
+    y,
+    { maxWidth: 180 }
+  );
+  y += 10;
+
+  // Findings table
+  autoTable(doc, {
+    startY: y,
+    head: [["Description", "CPT Code", "Charged", "Fair Rate", "Overcharge"]],
+    body: params.auditFindings.map((f) => [
+      f.description,
+      f.cptCode || "-",
+      `$${f.chargedAmount.toFixed(2)}`,
+      f.fairMarketRate ? `$${f.fairMarketRate.toFixed(2)}` : "-",
+      `$${f.overcharge.toFixed(2)}`,
+    ]),
+    headStyles: { fillColor: theme.headerColor, fontSize: 8 },
+    bodyStyles: { fontSize: 8 },
+    showHead: "everyPage",
+  });
+
+  y = (doc.lastAutoTable?.finalY || y) + 8;
+  doc.setFontSize(10);
+  doc.setTextColor(15, 23, 42);
+  doc.text(`Total Overcharge Identified: $${totalOvercharge.toFixed(2)}`, 14, y);
+  y += 8;
+  doc.text("We request a corrected bill reflecting fair market rates.", 14, y, { maxWidth: 180 });
+  y += 8;
+  doc.text("Please send the updated bill to:", 14, y);
+  y += 6;
+  doc.text(params.caregiverName, 14, y);
+  y += 5;
+  if (params.caregiverEmail) doc.text(params.caregiverEmail, 14, y);
+  if (params.caregiverEmail) y += 5;
+  if (params.caregiverPhone) doc.text(params.caregiverPhone, 14, y);
+  y += 10;
+  doc.text("Sincerely,", 14, y);
+  y += 6;
+  doc.text(params.caregiverName, 14, y);
+  y += 5;
+  doc.setFontSize(8);
+  doc.setTextColor(...theme.mutedColor);
+  doc.text("CareGuard AI Agent — Stellar Blockchain", 14, y);
+
+  addFooter(doc);
+  doc.save(`careguard-dispute-letter-${params.billId}.pdf`);
+}
