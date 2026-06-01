@@ -91,7 +91,7 @@ app.get("/pharmacy/compare", async (req, res) => {
       protocol: { name: "x402", network: NETWORK, price: "$0.002", payTo: PAY_TO },
       provider: pricingProvider.name,
       prices: sorted.map((p) => ({
-        pharmacyName: p.pharmacy, pharmacyId: p.id, price: p.price, distance: p.distance, inStock: true,
+        pharmacyName: p.pharmacy, pharmacyId: p.id, price: p.price, distance: p.distance, inStock: 'unknown',
       })),
       cheapest: { pharmacyName: cheapest.pharmacy, pharmacyId: cheapest.id, price: cheapest.price, distance: cheapest.distance },
       mostExpensive: { pharmacyName: mostExpensive.pharmacy, pharmacyId: mostExpensive.id, price: mostExpensive.price },

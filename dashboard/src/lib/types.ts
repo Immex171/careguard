@@ -27,7 +27,7 @@ export const PharmacyPriceSchema = z.object({
   pharmacyId: z.string().optional(),
   price: z.number(),
   distance: z.string().optional(),
-  inStock: z.boolean().optional(),
+  inStock: z.union([z.boolean(), z.literal('unknown')]).optional(),
 });
 
 export const PharmacyCompareResultSchema = z.object({

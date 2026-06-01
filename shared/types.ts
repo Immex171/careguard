@@ -14,7 +14,7 @@ export interface PharmacyPrice {
   pharmacyId: string;
   price: number;
   distance?: string;
-  inStock: boolean;
+  inStock: boolean | 'unknown';
 }
 
 export interface PriceComparisonResult {
