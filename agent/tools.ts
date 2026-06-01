@@ -32,8 +32,7 @@ import {
   decodePaymentResponseHeader,
 } from '@x402/fetch';
 import { createEd25519Signer, ExactStellarScheme } from '@x402/stellar';
-import { Mppx } from 'mppx/client';
-import { stellar as stellarCharge } from '@stellar/mpp/charge/client';
+import { createMppClient, type MppClientInstance } from './mpp-client.ts';
 import type { SpendingPolicy, Transaction } from '../shared/types.ts';
 import { SPENDING_TIMEZONE, getLocalDateStr } from './tz.ts';
 export { SPENDING_TIMEZONE, getLocalDateStr };
@@ -67,11 +66,28 @@ const USDC_ISSUER =
   process.env.USDC_ISSUER ||
   'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 const HORIZON_URL = 'https://horizon-testnet.stellar.org';
+const MIN_FEE_STROOPS = 100;
+const MAX_FEE_STROOPS = parseInt(process.env.MAX_FEE_STROOPS || '100000'); // Cap at 0.01 XLM default
 
 if (!AGENT_SECRET_KEY) throw new Error('AGENT_SECRET_KEY required in .env');
 
 const agentKeypair = Keypair.fromSecret(AGENT_SECRET_KEY);
 const horizonServer = new Horizon.Server(HORIZON_URL);
+
+// Helper: calculate recommended fee based on network conditions
+async function getRecommendedFee(): Promise<string> {
+  try {
+    const feeStats = await horizonServer.feeStats();
+    const recommendedFee = parseInt(feeStats.fee_charged.mode, 10);
+    // Use 1.5x the recommended fee to ensure acceptance during congestion
+    const adjustedFee = Math.max(MIN_FEE_STROOPS, Math.ceil(recommendedFee * 1.5));
+    const cappedFee = Math.min(adjustedFee, MAX_FEE_STROOPS);
+    return cappedFee.toString();
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, '[Stellar] Failed to fetch fee stats, using minimum fee');
+    return MIN_FEE_STROOPS.toString();
+  }
+}
 
 // Helper: extract real Stellar tx hash from x402 PAYMENT-RESPONSE header
 function extractX402TxHash(response: Response): string | undefined {
@@ -126,6 +142,57 @@ async function submitTransactionWithRetry(
   throw lastError;
 }
 
+// Helper: submit transaction with automatic fee bump on insufficient_fee error
+async function submitTransactionWithFeeBump(
+  server: Horizon.Server,
+  account: Horizon.ServerApi.AccountRecord,
+  operations: any[],
+  signer: Keypair,
+  initialFee?: string,
+): Promise<{ hash: string; fee: string }> {
+  let currentFee = initialFee || await getRecommendedFee();
+  let attempt = 0;
+  const maxAttempts = 2;
+
+  while (attempt < maxAttempts) {
+    try {
+      const tx = new TransactionBuilder(account, {
+        fee: currentFee,
+        networkPassphrase: Networks.TESTNET,
+      });
+
+      for (const op of operations) {
+        tx.addOperation(op);
+      }
+
+      const builtTx = tx.setTimeout(30).build();
+      builtTx.sign(signer);
+
+      const result = await submitTransactionWithRetry(server, builtTx);
+      return { hash: result.hash, fee: currentFee };
+    } catch (err: any) {
+      const resultCodes = err?.response?.data?.extras?.result_codes;
+      const isFeeError = resultCodes?.transaction === 'tx_insufficient_fee';
+
+      if (isFeeError && attempt < maxAttempts - 1) {
+        // Double the fee and retry
+        const newFee = Math.min(parseInt(currentFee) * 2, MAX_FEE_STROOPS);
+        logger.warn(
+          { oldFee: currentFee, newFee, attempt: attempt + 1 },
+          '[Stellar] Insufficient fee, retrying with higher fee',
+        );
+        currentFee = newFee.toString();
+        attempt++;
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  throw new Error('Failed to submit transaction after fee bump retries');
+}
+
 // Helper: wait for a Stellar transaction to be confirmed on-chain
 async function waitForStellarSettlement(
   txHash: string,
@@ -153,30 +220,27 @@ const x402ClientInstance = new x402Client().register(
 const x402Fetch = wrapFetchWithPayment(fetch, x402ClientInstance);
 
 // --- MPP Client: Auto-handles 402 for medication order payments ---
-// Track the latest MPP tx hash from progress events
-let lastMppTxHash: string | undefined;
-
-const mppClient = Mppx.create({
-  methods: [
-    stellarCharge({
-      keypair: agentKeypair,
-      mode: 'pull',
-      onProgress: (event) => {
-        logger.info(
-          {
-            type: event.type,
-            hash: 'hash' in event ? (event as any).hash : undefined,
-          },
-          '[MPP] progress',
-        );
-        if (event.type === 'paid' && 'hash' in event) {
-          lastMppTxHash = (event as any).hash;
-        }
-      },
-    }),
-  ],
-  polyfill: false,
+// Use factory function to create client instance (supports DI for testing)
+let mppClient: MppClientInstance = createMppClient({
+  keypair: agentKeypair,
+  mode: 'pull',
 });
+
+/**
+ * Set a custom MPP client instance (for testing/DI).
+ * @param client - MPP client instance to use
+ */
+export function setMppClient(client: MppClientInstance) {
+  mppClient = client;
+}
+
+/**
+ * Get the current MPP client instance.
+ * @returns Current MPP client
+ */
+export function getMppClient(): MppClientInstance {
+  return mppClient;
+}
 
 // --- Per-recipient data directories (Issue #261) ---
 const DATA_DIR = new URL('../data', import.meta.url).pathname;
@@ -641,7 +705,6 @@ async function executeMedicationPayment(
 
   let stellarTxHash: string | undefined;
   let mppOrderId: string | undefined;
-  lastMppTxHash = undefined;
 
   try {
     const response = await mppClient.fetch(
@@ -662,7 +725,7 @@ async function executeMedicationPayment(
       throw new Error(data.error || 'MPP payment failed');
     }
 
-    stellarTxHash = lastMppTxHash;
+    stellarTxHash = mppClient.lastTxHash;
     if (!stellarTxHash) {
       const receiptHeader =
         response.headers.get('Payment-Receipt') ||
@@ -713,32 +776,21 @@ async function executeBillPayment(
     const account = await horizonServer.loadAccount(agentKeypair.publicKey());
     const usdcAsset = new Asset('USDC', USDC_ISSUER);
 
-    const stellarTx = new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: Networks.TESTNET,
-    })
-      .addOperation(
-        Operation.payment({
-          destination: recipientKey,
-          asset: usdcAsset,
-          amount: amount.toFixed(7),
-        }),
-      )
-      .setTimeout(30)
-      .build();
+    const paymentOp = Operation.payment({
+      destination: recipientKey,
+      asset: usdcAsset,
+      amount: amount.toFixed(7),
+    });
 
-    stellarTx.sign(agentKeypair);
+    const result = await submitTransactionWithFeeBump(
+      horizonServer,
+      account,
+      [paymentOp],
+      agentKeypair,
+    );
 
-    const sigHint = stellarTx.signatures[0]?.hint();
-    if (!sigHint || !sigHint.equals(agentKeypair.signatureHint())) {
-      throw new Error(
-        `Signer mismatch: expected ${agentKeypair.publicKey()} — refusing to submit`,
-      );
-    }
-
-    const result = await submitTransactionWithRetry(horizonServer, stellarTx);
     stellarTxHash = result.hash;
-    logger.info({ txHash: stellarTxHash }, '[Stellar] TX confirmed');
+    logger.info({ txHash: stellarTxHash, fee: result.fee }, '[Stellar] TX confirmed');
   } catch (err: any) {
     stellarTxSubmittedTotal.inc({ result: 'error' });
     const errorDetail =
@@ -932,7 +984,6 @@ export async function payForMedication(
 
   let stellarTxHash: string | undefined;
   let mppOrderId: string | undefined;
-  lastMppTxHash = undefined; // reset before this payment
 
   try {
     const response = await mppClient.fetch(
@@ -951,7 +1002,7 @@ export async function payForMedication(
     const data = await response.json();
     if (data.success) {
       // Try to get tx hash from: 1) MPP progress event, 2) Payment-Receipt header
-      stellarTxHash = lastMppTxHash;
+      stellarTxHash = mppClient.lastTxHash;
       if (!stellarTxHash) {
         const receiptHeader =
           response.headers.get('Payment-Receipt') ||
@@ -1096,37 +1147,21 @@ export async function payBill(
     const account = await horizonServer.loadAccount(agentKeypair.publicKey());
     const usdcAsset = new Asset('USDC', USDC_ISSUER);
 
-    const stellarTx = new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: Networks.TESTNET,
-    })
-      .addOperation(
-        Operation.payment({
-          destination: recipientKey,
-          asset: usdcAsset,
-          amount: amount.toFixed(7),
-        }),
-      )
-      .setTimeout(30)
-      .build();
+    const paymentOp = Operation.payment({
+      destination: recipientKey,
+      asset: usdcAsset,
+      amount: amount.toFixed(7),
+    });
 
-    stellarTx.sign(agentKeypair);
-
-    // Belt-and-braces: verify the signed envelope's signer hint matches the agent keypair
-    // before broadcast — cheap guard against future wallet mix-ups.
-    const sigHint = stellarTx.signatures[0]?.hint();
-    if (!sigHint || !sigHint.equals(agentKeypair.signatureHint())) {
-      throw new Error(
-        `Signer mismatch: expected ${agentKeypair.publicKey()} — refusing to submit`,
-      );
-    }
-    console.log(
-      `  [Stellar] Signer verified: ${agentKeypair.publicKey().slice(0, 8)}...`,
+    const result = await submitTransactionWithFeeBump(
+      horizonServer,
+      account,
+      [paymentOp],
+      agentKeypair,
     );
 
-    const result = await submitTransactionWithRetry(horizonServer, stellarTx);
     stellarTxHash = result.hash;
-    logger.info({ txHash: stellarTxHash }, '[Stellar] TX confirmed');
+    logger.info({ txHash: stellarTxHash, fee: result.fee }, '[Stellar] TX confirmed');
   } catch (err: any) {
     stellarTxSubmittedTotal.inc({ result: 'error' });
     const errorDetail =

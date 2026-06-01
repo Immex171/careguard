@@ -15,6 +15,7 @@ if (!process.stdout.isTTY) {
 import "dotenv/config";
 import express from "express";
 import { z } from "zod";
+import { readFileSync } from "fs";
 import { applyX402Middleware, NETWORK, OZ_FACILITATOR_URL } from "../../shared/x402-middleware.ts";
 import { createCorsMiddleware } from "../../shared/cors.ts";
 import { applySecurityMiddleware } from "../../shared/security-middleware.ts";
@@ -26,6 +27,43 @@ const PORT = parseInt(process.env.BILL_AUDIT_API_PORT || "3002");
 const PAY_TO = process.env.BILL_PROVIDER_PUBLIC_KEY;
 
 if (!PAY_TO) throw new Error("BILL_PROVIDER_PUBLIC_KEY required in .env");
+
+// Duplicate detection allowlist configuration
+interface DuplicateAllowlistEntry {
+  code: string;
+  reason: string;
+  addedBy: string;
+  addedAt: string;
+  facilityId?: string; // Optional: per-facility override
+}
+
+let duplicateAllowlist: Set<string> = new Set();
+let allowlistMetadata: Map<string, DuplicateAllowlistEntry> = new Map();
+
+function loadDuplicateAllowlist() {
+  try {
+    const allowlistPath = new URL('./duplicates-allowlist.json', import.meta.url).pathname;
+    const data = JSON.parse(readFileSync(allowlistPath, 'utf-8')) as DuplicateAllowlistEntry[];
+    
+    duplicateAllowlist = new Set(data.map(entry => entry.code));
+    allowlistMetadata = new Map(data.map(entry => [entry.code, entry]));
+    
+    logger.info({ count: duplicateAllowlist.size, codes: Array.from(duplicateAllowlist) }, 'Loaded duplicate detection allowlist');
+  } catch (err: any) {
+    logger.error({ err: err.message }, 'Failed to load duplicates-allowlist.json, using empty allowlist');
+    duplicateAllowlist = new Set();
+    allowlistMetadata = new Map();
+  }
+}
+
+// Load allowlist at boot
+loadDuplicateAllowlist();
+
+// Reload allowlist on SIGHUP
+process.on('SIGHUP', () => {
+  logger.info('SIGHUP received, reloading duplicate allowlist');
+  loadDuplicateAllowlist();
+});
 
 // Fair market rate database — based on CMS Medicare Physician Fee Schedule 2026
 const FAIR_MARKET_RATES: Record<string, { description: string; fairRate: number }> = {
@@ -71,7 +109,7 @@ function auditBill(lineItems: BillItem[]) {
     const fairAmount = fairRate ? fairRate.fairRate * item.quantity : null;
 
     seenCodes[item.cptCode] = (seenCodes[item.cptCode] || 0) + 1;
-    if (seenCodes[item.cptCode] > 1 && !["96372", "97110"].includes(item.cptCode)) {
+    if (seenCodes[item.cptCode] > 1 && !duplicateAllowlist.has(item.cptCode)) {
       errorCount++;
       results.push({ description: item.description, cptCode: item.cptCode, quantity: item.quantity, chargedAmount: item.chargedAmount, fairMarketRate: fairAmount, status: "duplicate", errorDescription: `Duplicate charge for CPT ${item.cptCode}. Appears ${seenCodes[item.cptCode]} times.`, suggestedAmount: 0 });
       continue;
