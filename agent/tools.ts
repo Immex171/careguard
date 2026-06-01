@@ -21,6 +21,7 @@ import { stellar as stellarCharge } from "@stellar/mpp/charge/client";
 import type { SpendingPolicy, Transaction } from "../shared/types.ts";
 import { SPENDING_TIMEZONE, getLocalDateStr } from "./tz.ts";
 export { SPENDING_TIMEZONE, getLocalDateStr };
+import { appendAuditEntry } from "../shared/audit-log.ts";
 import {
   x402SettlementsTotal,
   paymentsUsdcTotal,
@@ -55,6 +56,48 @@ function extractX402TxHash(response: Response): string | undefined {
     // If decode fails, the header itself might be a raw hash
     return header.length === 64 ? header : undefined;
   }
+}
+
+// Helper: submitTransaction with timeout and retry
+async function submitTransactionWithRetry(
+  server: Horizon.Server,
+  tx: any,
+  maxRetries = 2,
+  timeoutMs = 35000
+): Promise<any> {
+  let lastError: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await server.submitTransaction(tx, { timeout: timeoutMs });
+      return result;
+    } catch (err: any) {
+      lastError = err;
+      // Don't retry if the server responded with a transaction failure
+      if (err?.response?.status) throw err;
+      // Don't retry if the transaction expired
+      const msg = err?.message ?? "";
+      if (msg.includes("tx_bad_seq") || msg.includes("tx_too_early") || msg.includes("tx_too_late")) throw err;
+      if (attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 500;
+        logger.warn({ attempt: attempt + 1, maxRetries, delay }, "[Stellar] submitTransaction timeout, retrying");
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError;
+}
+
+// Helper: wait for a Stellar transaction to be confirmed on-chain
+async function waitForStellarSettlement(txHash: string, maxRetries = 5, intervalMs = 1000): Promise<boolean> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      await horizonServer.transactions().transaction(txHash).call();
+      return true;
+    } catch {
+      if (i < maxRetries - 1) await new Promise(r => setTimeout(r, intervalMs));
+    }
+  }
+  return false;
 }
 
 // --- x402 Client: Auto-handles 402 Payment Required for API queries ---
@@ -136,13 +179,28 @@ function savePolicy(policy: SpendingPolicy) {
 let currentPolicy: SpendingPolicy = loadPolicy();
 
 export function setSpendingPolicy(policy: SpendingPolicy) {
+  const previous = currentPolicy;
   currentPolicy = policy;
   savePolicy(policy);
+  appendAuditEntry({
+    event: "policy.updated",
+    actor: "caregiver",
+    details: {
+      previous: { ...previous },
+      current: { ...policy },
+    },
+  });
 }
 export function getSpendingTracker() { return { ...spendingTracker, policy: currentPolicy }; }
 export function resetSpendingTracker() {
+  const previousTotal = spendingTracker.medications + spendingTracker.bills + spendingTracker.serviceFees;
   spendingTracker = { medications: 0, bills: 0, serviceFees: 0, transactions: [] };
   saveSpending(spendingTracker);
+  appendAuditEntry({
+    event: "spending.reset",
+    actor: "caregiver",
+    details: { previousTotal: +previousTotal.toFixed(2) },
+  });
 }
 
 // --- Tool: Compare pharmacy prices (pays via x402) ---
@@ -161,6 +219,14 @@ export async function comparePharmacyPrices(drugName: string, zipCode: string = 
 
   // Extract real Stellar tx hash from x402 payment response header
   const txHash = extractX402TxHash(response);
+
+  // Wait for on-chain settlement before recording the fee
+  if (txHash) {
+    const settled = await waitForStellarSettlement(txHash);
+    if (!settled) {
+      throw new Error(`x402 settlement not confirmed on-chain for tx ${txHash}`);
+    }
+  }
 
   x402SettlementsTotal.inc();
   spendingTracker.serviceFees += 0.002;
@@ -277,6 +343,14 @@ export async function auditBill(lineItems: Array<{ description: string; cptCode:
 
   const txHash = extractX402TxHash(response);
 
+  // Wait for on-chain settlement before recording the fee
+  if (txHash) {
+    const settled = await waitForStellarSettlement(txHash);
+    if (!settled) {
+      throw new Error(`x402 settlement not confirmed on-chain for tx ${txHash}`);
+    }
+  }
+
   x402SettlementsTotal.inc();
   spendingTracker.serviceFees += 0.01;
   spendingTracker.transactions.push({
@@ -312,6 +386,14 @@ export async function checkDrugInteractions(medications: string[]) {
   const data = await response.json();
 
   const txHash = extractX402TxHash(response);
+
+  // Wait for on-chain settlement before recording the fee
+  if (txHash) {
+    const settled = await waitForStellarSettlement(txHash);
+    if (!settled) {
+      throw new Error(`x402 settlement not confirmed on-chain for tx ${txHash}`);
+    }
+  }
 
   x402SettlementsTotal.inc();
   spendingTracker.serviceFees += 0.001;
@@ -506,8 +588,8 @@ export async function payBill(providerId: string, providerName: string, descript
     }
     console.log(`  [Stellar] Signer verified: ${agentKeypair.publicKey().slice(0, 8)}...`);
 
-    const result = await horizonServer.submitTransaction(stellarTx);
-    stellarTxHash = (result as any).hash;
+    const result = await submitTransactionWithRetry(horizonServer, stellarTx);
+    stellarTxHash = result.hash;
     logger.info({ txHash: stellarTxHash }, "[Stellar] TX confirmed");
   } catch (err: any) {
     stellarTxSubmittedTotal.inc({ result: "error" });

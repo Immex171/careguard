@@ -110,8 +110,10 @@ const LLM_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = TOOL_DEFINITIONS
   },
 }));
 
+type ToolResult = Record<string, unknown>;
+
 // Execute a tool call
-async function executeTool(name: string, input: any): Promise<any> {
+async function executeTool(name: string, input: Record<string, unknown>): Promise<ToolResult> {
   try {
     let result: any;
     switch (name) {
@@ -161,7 +163,7 @@ async function runAgent(task: string) {
     { role: "system", content: SCRUBBED_SYSTEM_PROMPT },
     { role: "user", content: userTask },
   ];
-  const toolCalls: Array<{ tool: string; input: any; result: any }> = [];
+  const toolCalls: Array<{ tool: string; input: Record<string, unknown>; result: ToolResult }> = [];
   let finalResponse = "";
   let llmUsage: { promptTokens: number; completionTokens: number } = { promptTokens: 0, completionTokens: 0 };
   let runToolCalls = 0;
@@ -238,7 +240,7 @@ async function runAgent(task: string) {
 
       logger.info({ tool: fnName, args: JSON.stringify(fnArgs).slice(0, 100) }, "tool call");
 
-      let result: any;
+      let result: ToolResult;
       try {
         result = await executeTool(fnName, fnArgs);
         toolCalls.push({ tool: fnName, input: fnArgs, result });
