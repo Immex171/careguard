@@ -59,6 +59,7 @@ async function addUsdcTrustline(keypair: Keypair): Promise<void> {
 }
 
 async function main() {
+  const writeEnv = process.argv.includes("--write-env");
   logger.info("CareGuard Wallet Setup starting");
 
   const wallets: WalletInfo[] = [
@@ -91,12 +92,34 @@ async function main() {
   }
 
   // Step 3: Output .env values — written directly so they are copy-pasteable
-  process.stdout.write("\n=== Add these to your .env file ===\n\n");
+  const envLines: string[] = [];
   for (const wallet of wallets) {
-    process.stdout.write(`${wallet.name}_SECRET_KEY=${wallet.secretKey}\n`);
-    process.stdout.write(`${wallet.name}_PUBLIC_KEY=${wallet.publicKey}\n`);
+    envLines.push(`${wallet.name}_SECRET_KEY=${wallet.secretKey}`);
+    envLines.push(`${wallet.name}_PUBLIC_KEY=${wallet.publicKey}`);
   }
-  process.stdout.write(`\n# USDC Testnet\nUSDC_ISSUER=${USDC_ISSUER}\n`);
+  envLines.push(`\n# USDC Testnet\nUSDC_ISSUER=${USDC_ISSUER}`);
+
+  if (writeEnv) {
+    const confirmMsg = "Write these values to .env in the current directory? (y/N) ";
+    process.stdout.write(confirmMsg);
+    const answer = await new Promise<string>((resolve) => {
+      process.stdin.once("data", (data) => resolve(data.toString().trim().toLowerCase()));
+    });
+    if (answer === "y" || answer === "yes") {
+      const fs = await import("fs");
+      const existing = fs.existsSync(".env") ? fs.readFileSync(".env", "utf-8") : "";
+      const updated = existing + (existing.endsWith("\n") ? "" : "\n") + envLines.join("\n") + "\n";
+      fs.writeFileSync(".env", updated);
+      logger.info(".env file updated");
+    } else {
+      logger.info("Skipped writing .env");
+    }
+  }
+
+  process.stdout.write("\n=== Add these to your .env file ===\n\n");
+  for (const line of envLines) {
+    process.stdout.write(line + "\n");
+  }
   process.stdout.write(`\n=== IMPORTANT ===\nNow get testnet USDC for the AGENT wallet:\n`);
   process.stdout.write(`1. Go to https://faucet.circle.com\n2. Select "Stellar Testnet"\n`);
   process.stdout.write(`3. Paste the AGENT public key: ${wallets[0].publicKey}\n`);

@@ -484,7 +484,7 @@ app.get("/pharmacy/compare", (req, res) => {
       pharmacyId: p.id,
       price: p.price,
       distance: p.distance,
-      inStock: true,
+      inStock: 'unknown',
     })),
     cheapest: {
       pharmacyName: cheapest.pharmacy,

@@ -1224,6 +1224,7 @@ export async function getWalletBalance() {
           ? parseFloat((xlmBalance as any).balance).toFixed(2)
           : '0.00',
       },
+      usdcTrustlineMissing: !usdcBalance,
       timestamp: new Date().toISOString(),
     };
   } catch (err: any) {
@@ -1356,7 +1357,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'compare_pharmacy_prices',
     description:
-      'Compare medication prices across multiple pharmacies. Pays $0.002 USDC per query via x402 on Stellar. Returns prices sorted cheapest to most expensive, with potential savings.',
+      'Compare medication prices across multiple pharmacies. Pays $0.002 USDC per query via x402 on Stellar. Returns prices sorted cheapest to most expensive, with potential savings. Each pharmacy has an inStock field: "unknown" means real-time inventory is unavailable (proceed with caution), true means in stock. Never assume a medication is in stock if inStock is "unknown" — confirm with the pharmacy before ordering.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -1486,7 +1487,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'get_wallet_balance',
     description:
-      'Get the current on-chain wallet balance (USDC and XLM) from Stellar Horizon. Returns real-time balance data.',
+      'Get the current on-chain wallet balance (USDC and XLM) from Stellar Horizon. Returns real-time balance data. If usdcTrustlineMissing is true, the agent wallet lacks a USDC trustline — instruct the caregiver to fund the wallet at https://faucet.circle.com.',
     input_schema: {
       type: 'object' as const,
       properties: {

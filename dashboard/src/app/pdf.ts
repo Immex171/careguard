@@ -209,7 +209,7 @@ export function downloadMedicationPDF(
     autoTable(doc, {
       startY: y,
       head: [["Pharmacy", "Price", "Distance", "In Stock"]],
-      body: r.prices.map((p) => [p.pharmacyName, `$${p.price}`, p.distance || "-", p.inStock ? "Yes" : "No"]),
+      body: r.prices.map((p) => [p.pharmacyName, `$${p.price}`, p.distance || "-", p.inStock === true ? "Yes" : p.inStock === 'unknown' ? "Unknown" : "No"]),
       headStyles: { fillColor: theme.headerColor, fontSize: 7 },
       bodyStyles: { fontSize: 7 },
       alternateRowStyles: { fillColor: [248, 250, 252] },

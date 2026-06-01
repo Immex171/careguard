@@ -334,7 +334,7 @@ app.use(rateLimiters.default);
 
 applySecurityMiddleware(app);
 app.use(createCorsMiddleware());
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT ?? "20kb" }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT ?? "64kb" }));
 app.use(requestContextMiddleware());
 app.use(requestLoggerMiddleware());
 app.get("/metrics", metricsHandler());
