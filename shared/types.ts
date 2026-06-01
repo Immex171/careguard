@@ -53,6 +53,12 @@ export interface SpendingPolicy {
   billMonthlyBudget: number;
   approvalThreshold: number; // require caregiver approval above this amount
   holdTimeSeconds: number; // time before pending approvals auto-approve
+  notifications?: {
+    email: boolean;
+    sms: boolean;
+    emailAddress?: string;
+    phoneNumber?: string;
+  };
 }
 
 export interface Transaction {

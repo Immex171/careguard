@@ -5,6 +5,7 @@ import { Bar } from "../primitives/bar";
 import { Btn } from "../primitives/btn";
 import { Card } from "../primitives/card";
 import type { AgentResult, SpendingData } from "../types";
+import type { RecipientProfile } from "../../lib/types";
 
 export interface OverviewTabProps {
   spending: SpendingData | null;
@@ -13,6 +14,7 @@ export interface OverviewTabProps {
   loading: boolean;
   activeTask: string;
   onRunTask: (task: string, label: string) => void;
+  recipient?: RecipientProfile;
 }
 
 const TASKS = {
@@ -165,6 +167,26 @@ export function OverviewTab({
           <div className="mt-4 text-xs text-slate-400">
             {agentResult.toolCalls.length} tool calls | API cost: $
             {agentResult.spending.spending.serviceFees.toFixed(4)}
+          </div>
+        </div>
+      )}
+
+      {/* Medication Adherence Prompt (Issue #264) */}
+      {agentResult?.toolCalls.some((t) => t.tool === "pay_for_medication" && t.result?.success) && (
+        <div className="bg-white rounded-xl border border-amber-200 p-6">
+          <h2 className="text-sm font-semibold text-amber-800 mb-2">
+            Medication Adherence Check
+          </h2>
+          <p className="text-sm text-amber-700">
+            Did {recipient?.name || "the care recipient"} take their medication today?
+          </p>
+          <div className="mt-3 flex gap-2">
+            <button className="px-4 py-2 bg-green-50 text-green-700 rounded-lg text-xs font-medium hover:bg-green-100 cursor-pointer transition-all">
+              Yes — Taken
+            </button>
+            <button className="px-4 py-2 bg-red-50 text-red-700 rounded-lg text-xs font-medium hover:bg-red-100 cursor-pointer transition-all">
+              Not Yet
+            </button>
           </div>
         </div>
       )}

@@ -48,6 +48,7 @@ import {
   generateDisputeLetter,
   getAdherenceStatus,
   confirmAdherenceReminder,
+  setCurrentRecipient,
   TOOL_DEFINITIONS,
 } from "./tools.ts";
 import { getPendingAdherences } from "../shared/adherence.ts";
@@ -128,6 +129,7 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   try {
     let result: any;
     const rid = (input.recipient_id as string) || "rosa";
+    setCurrentRecipient(rid);
     const dName = input.drug_name as string | undefined;
     const zip = input.zip_code as string | undefined;
     const pharmId = input.pharmacy_id as string | undefined;
@@ -154,16 +156,16 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
         } else {
           items = input.line_items || input.line_items_json;
         }
-        result = await auditBill(items, rid);
+        result = await auditBill(items);
         break;
       }
       case "fetch_rosa_bill": result = await fetchRosaBill(); break;
-      case "fetch_and_audit_bill": result = await fetchAndAuditBill(rid); break;
+      case "fetch_and_audit_bill": result = await fetchAndAuditBill(); break;
       case "check_drug_interactions": result = await checkDrugInteractions(input.medications as string[]); break;
-      case "pay_for_medication": result = await payForMedication(pharmId || "", pharmName || "", drugN || "", amt, false, rid); break;
-      case "pay_bill": result = await payBill(provId || "", provName || "", desc || "", amt, false, rid); break;
-      case "check_spending_policy": result = checkSpendingPolicy(amt, cat as "medications" | "bills", rid); break;
-      case "get_spending_summary": result = getSpendingSummary(rid); break;
+      case "pay_for_medication": result = await payForMedication(pharmId || "", pharmName || "", drugN || "", amt); break;
+      case "pay_bill": result = await payBill(provId || "", provName || "", desc || "", amt); break;
+      case "check_spending_policy": result = checkSpendingPolicy(amt, cat as "medications" | "bills"); break;
+      case "get_spending_summary": result = getSpendingSummary(); break;
       case "get_wallet_balance": result = await getWalletBalance(); break;
       case "generate_dispute_letter": {
         let auditResult: any;
@@ -232,11 +234,11 @@ async function runAgent(task: string) {
       if (toolCalls.length > 0 && !finalResponse) {
         finalResponse = toolCalls.map(tc => {
           if (tc.result?.error) return `${tc.tool}: ${tc.result.error}`;
-          if (tc.tool === "compare_pharmacy_prices" && tc.result?.cheapest) return `${tc.result.drug}: cheapest at $${tc.result.cheapest.price} (${tc.result.cheapest.pharmacyName}), save $${tc.result.potentialSavings}/mo`;
-          if (tc.tool === "audit_medical_bill" && tc.result?.totalOvercharge) return `Bill audit: $${tc.result.totalOvercharge} in overcharges found (${tc.result.errorCount} errors)`;
-          if (tc.tool === "check_drug_interactions" && tc.result?.summary) return tc.result.summary;
-          if (tc.tool === "pay_for_medication" && tc.result?.success) return `Paid $${tc.result.transaction.amount} for ${tc.result.transaction.description}`;
-          if (tc.tool === "pay_bill" && tc.result?.success) return `Paid bill: $${tc.result.transaction.amount}`;
+          if (tc.tool === "compare_pharmacy_prices" && (tc.result as any)?.cheapest) return `${(tc.result as any).drug}: cheapest at $${(tc.result as any).cheapest.price} (${(tc.result as any).cheapest.pharmacyName}), save $${(tc.result as any).potentialSavings}/mo`;
+          if (tc.tool === "audit_medical_bill" && (tc.result as any)?.totalOvercharge) return `Bill audit: $${(tc.result as any).totalOvercharge} in overcharges found (${(tc.result as any).errorCount} errors)`;
+          if (tc.tool === "check_drug_interactions" && (tc.result as any)?.summary) return (tc.result as any).summary;
+          if (tc.tool === "pay_for_medication" && (tc.result as any)?.success) return `Paid $${(tc.result as any).transaction.amount} for ${(tc.result as any).transaction.description}`;
+          if (tc.tool === "pay_bill" && (tc.result as any)?.success) return `Paid bill: $${(tc.result as any).transaction.amount}`;
           return `${tc.tool}: completed`;
         }).join("\n");
       } else if (!finalResponse) {
@@ -377,7 +379,8 @@ app.get("/agent/wallet", async (req, res) => {
 // Pending approvals
 app.get("/agent/pending-approvals", (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  const tracker = getSpendingTracker(recipientId);
+  setCurrentRecipient(recipientId);
+  const tracker = getSpendingTracker();
   const pending = tracker.transactions.filter((t: any) => t.status === "pending");
   res.json({ approvals: pending, recipientId });
 });
@@ -387,7 +390,8 @@ app.post("/agent/approvals/:txId", async (req, res) => {
   const { txId } = req.params;
   const { approve } = req.body;
   const recipientId = (req.query.recipient_id as string) || (req.body.recipient_id as string) || "rosa";
-  const tracker = getSpendingTracker(recipientId);
+  setCurrentRecipient(recipientId);
+  const tracker = getSpendingTracker();
   const txIndex = tracker.transactions.findIndex((t: any) => t.id === txId);
   if (txIndex === -1) return res.status(404).json({ error: "Transaction not found" });
   const tx = tracker.transactions[txIndex];
@@ -395,7 +399,7 @@ app.post("/agent/approvals/:txId", async (req, res) => {
 
   if (!approve) {
     (tx as any).status = "rejected";
-    saveSpending(recipientId, tracker);
+    saveSpending(tracker);
     return res.json({ success: true, status: "rejected" });
   }
 
@@ -406,13 +410,13 @@ app.post("/agent/approvals/:txId", async (req, res) => {
       if (!match) throw new Error("Cannot parse transaction description");
       const [, drugName, pharmacyName] = match;
       const pharmacyId = tx.recipient;
-      result = await payForMedication(pharmacyId, pharmacyName, drugName, tx.amount, true, recipientId);
+      result = await payForMedication(pharmacyId, pharmacyName, drugName, tx.amount, true);
     } else if (tx.category === "bills") {
       const match = tx.description.match(/(.+) — (.+)/);
       if (!match) throw new Error("Cannot parse transaction description");
       const [, description, providerName] = match;
       const providerId = tx.recipient;
-      result = await payBill(providerId, providerName, description, tx.amount, true, recipientId);
+      result = await payBill(providerId, providerName, description, tx.amount, true);
     } else {
       throw new Error("Unknown transaction category");
     }
@@ -421,11 +425,11 @@ app.post("/agent/approvals/:txId", async (req, res) => {
       tx.status = "completed";
       tx.stellarTxHash = result.transaction?.stellarTxHash;
       tracker.transactions[txIndex] = tx;
-      saveSpending(recipientId, tracker);
+      saveSpending(tracker);
       return res.json({ success: true, status: "completed", transaction: result.transaction });
     } else {
       (tx as any).status = "rejected";
-      saveSpending(recipientId, tracker);
+      saveSpending(tracker);
       return res.status(400).json({ success: false, error: result.error, status: "rejected" });
     }
   } catch (err: any) {
@@ -486,11 +490,13 @@ app.post("/agent/run", async (req, res) => {
 
 app.get("/agent/spending", (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  res.json(getSpendingSummary(recipientId));
+  setCurrentRecipient(recipientId);
+  res.json(getSpendingSummary());
 });
 app.get("/agent/transactions", (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  res.json(getSpendingTracker(recipientId));
+  setCurrentRecipient(recipientId);
+  res.json(getSpendingTracker());
 });
 function validatePolicyPayload(body: any): { ok: true; policy: any } | { ok: false; errors: string[] } {
   const errors: string[] = [];
@@ -516,12 +522,14 @@ app.post("/agent/policy", (req, res) => {
   const result = validatePolicyPayload(req.body);
   if (!result.ok) return res.status(400).json({ error: "Invalid policy", details: result.errors });
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  setSpendingPolicy(recipientId, result.policy);
+  setCurrentRecipient(recipientId);
+  setSpendingPolicy(result.policy);
   res.json({ success: true, policy: result.policy, recipientId });
 });
 app.post("/agent/reset", (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  resetSpendingTracker(recipientId);
+  setCurrentRecipient(recipientId);
+  resetSpendingTracker();
   res.json({ success: true, recipientId });
 });
 

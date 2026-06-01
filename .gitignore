@@ -7,5 +7,8 @@ dist/
 data/audit.log.jsonl
 data/spending.json
 data/orders.json
+data/adherence.jsonl
+data/recipients/*/*.json
+!data/recipients/*/
 .DS_Store
 fix.md
