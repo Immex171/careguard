@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Bar } from "../primitives/bar";
 import { Btn } from "../primitives/btn";
 import { Card } from "../primitives/card";
@@ -56,6 +57,8 @@ export function OverviewTab({
       tabIndex={0}
       className="space-y-6"
     >
+      <AdherencePrompt />
+
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card
           label="Monthly Spending"
@@ -163,6 +166,62 @@ export function OverviewTab({
             {agentResult.toolCalls.length} tool calls | API cost: $
             {agentResult.spending.spending.serviceFees.toFixed(4)}
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdherencePrompt() {
+  const [adherence, setAdherence] = useState<{ pending: Array<{ id: string; drug: string; dueDate: string }>; flagged: Array<{ id: string; drug: string }> } | null>(null);
+
+  useEffect(() => {
+    fetch("/agent/adherence/pending?recipient_id=rosa")
+      .then((r) => r.json())
+      .then((data) => setAdherence(data))
+      .catch(() => {});
+  }, []);
+
+  const handleConfirm = async (recordId: string) => {
+    try {
+      await fetch("/agent/adherence/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ record_id: recordId }),
+      });
+      setAdherence((prev) => prev ? { ...prev, pending: prev.pending.filter((p) => p.id !== recordId) } : prev);
+    } catch {}
+  };
+
+  if (!adherence || (adherence.pending.length === 0 && adherence.flagged.length === 0)) return null;
+
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+      <h2 className="text-sm font-semibold text-amber-800 mb-2">Medication Adherence</h2>
+      {adherence.flagged.length > 0 && (
+        <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded-lg">
+          <p className="text-xs font-medium text-red-700">
+            {adherence.flagged.length} medication(s) flagged for persistent skipped doses
+          </p>
+        </div>
+      )}
+      {adherence.pending.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-xs text-amber-700">Did Rosa take her medication?</p>
+          {adherence.pending.map((item) => (
+            <div key={item.id} className="flex items-center justify-between bg-white rounded-lg p-2 border border-amber-100">
+              <div>
+                <span className="text-sm font-medium text-slate-700">{item.drug}</span>
+                <span className="text-xs text-slate-400 ml-2">due {new Date(item.dueDate).toLocaleDateString()}</span>
+              </div>
+              <button
+                onClick={() => handleConfirm(item.id)}
+                className="px-3 py-1 bg-green-50 text-green-700 rounded-lg text-xs font-medium hover:bg-green-100 cursor-pointer"
+              >
+                Confirm Taken
+              </button>
+            </div>
+          ))}
         </div>
       )}
     </div>
