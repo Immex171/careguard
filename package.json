@@ -13,7 +13,7 @@
     "services": "concurrently --kill-others-on-fail \"npm run pharmacy-api\" \"npm run bill-audit-api\" \"npm run drug-api\" \"npm run pharmacy-payment\"",
     "start": "node --import tsx server.ts",
     "dev": "node --import tsx server.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -b",
     "build": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "vitest run",

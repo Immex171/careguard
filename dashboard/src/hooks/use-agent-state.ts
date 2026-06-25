@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import {
   SpendingDataSchema,
   TransactionSchema,
@@ -215,6 +216,7 @@ export function useAgentState({ activeTab }: UseAgentStateOptions) {
           addLogEntry(
             `[${new Date().toLocaleTimeString()}] Error (${res.status}): ${errMsg}`,
           );
+          toast.error(`Agent error (${res.status}): ${errMsg}`);
           return;
         }
         const data: AgentResult = await res.json();
@@ -236,6 +238,7 @@ export function useAgentState({ activeTab }: UseAgentStateOptions) {
         addLogEntry(
           `[${new Date().toLocaleTimeString()}] Connection error: ${err.message}`,
         );
+        toast.error(`Connection error: ${err.message}`);
         setAgentConnected(false);
       } finally {
         setLoading(false);

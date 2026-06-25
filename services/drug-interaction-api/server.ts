@@ -39,6 +39,13 @@ const INTERACTIONS: Interaction[] = [
   { drugs: ["lisinopril", "amlodipine"], severity: "mild", description: "Common intentional combination for blood pressure management. Both lower BP through different mechanisms.", recommendation: "Monitor for excessive blood pressure lowering (dizziness, lightheadedness)." },
 ];
 
+// Normalize drug names to lowercase at startup — defense-in-depth even though
+// checkInteractions() already lowercases input, the source data should be clean too.
+const NORMALIZED_INTERACTIONS = INTERACTIONS.map(ix => ({
+  ...ix,
+  drugs: [ix.drugs[0].toLowerCase(), ix.drugs[1].toLowerCase()] as [string, string],
+}));
+
 /**
  * Sort drug interaction pairs by severity (severe > moderate > mild)
  * and alphabetically by drug name for equal severities.
@@ -62,7 +69,7 @@ function checkInteractions(medications: string[]) {
 
   for (let i = 0; i < meds.length; i++) {
     for (let j = i + 1; j < meds.length; j++) {
-      for (const ix of INTERACTIONS) {
+      for (const ix of NORMALIZED_INTERACTIONS) {
         const [a, b] = ix.drugs;
         if ((meds[i] === a && meds[j] === b) || (meds[i] === b && meds[j] === a)) {
           found.push({ drug1: medications[i], drug2: medications[j], severity: ix.severity, description: ix.description, recommendation: ix.recommendation });
